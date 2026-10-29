@@ -1,0 +1,40 @@
+{
+  "name": "fm-career-challenge-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.64.0",
+    "@microsoft/signalr": "^10.0.11",
+    "@primeuix/themes": "^1.2.3",
+    "@tanstack/vue-query": "^5.105.0",
+    "@vueuse/core": "^15.0.0",
+    "echarts": "^6.1.0",
+    "pinia": "^4.1.0",
+    "primevue": "4.5.5",
+    "tailwindcss-primeui": "^0.6.1",
+    "vee-validate": "^4.15.1",
+    "vue": "^3.5.44",
+    "vue-echarts": "^8.3.2",
+    "vue-i18n": "^11.4.16",
+    "vue-router": "^4.6.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-vue": "^6.0.4",
+    "@vue/test-utils": "^2.5.1",
+    "jsdom": "^29.1.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5",
+    "vue-tsc": "^3.3.13"
+  }
+}
