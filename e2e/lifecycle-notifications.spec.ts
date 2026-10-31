@@ -54,9 +54,8 @@ test('persists offline invitation notifications and restricts challenge lifecycl
 
     await rival.goto(`/dashboard?invite=${encodeURIComponent(inviteToken!)}`)
     await rival.getByRole('button', { name: 'Join challenge' }).click()
-    await expect(rival.getByText(challengeName)).toBeVisible()
-    await rival.locator('article').filter({ hasText: challengeName })
-      .getByRole('button', { name: 'Open challenge' }).click()
+    await expect(rival.getByRole('status').filter({ hasText: 'Invitation accepted.' })).toBeVisible()
+    await rival.getByRole('button', { name: 'Open joined challenge' }).click()
     await expect(rival.getByRole('heading', { name: challengeName })).toBeVisible()
 
     const owner = await page.context().newPage()
@@ -87,6 +86,7 @@ test('persists offline invitation notifications and restricts challenge lifecycl
     }, challengeId)
     expect(forbiddenArchiveStatus).toBe(403)
 
+    await owner.locator('summary').filter({ hasText: 'Manage challenge' }).click()
     owner.once('dialog', dialog => dialog.accept())
     await owner.getByRole('button', { name: 'Archive challenge', exact: true }).click()
     await expect(owner.locator('.hero-kicker')).toContainText('ARCHIVED')

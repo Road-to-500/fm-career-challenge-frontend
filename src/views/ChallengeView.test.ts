@@ -1,18 +1,24 @@
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, shallowMount } from '@vue/test-utils'
-import { nextTick } from 'vue'
+import { nextTick, reactive } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import ChallengeView from './ChallengeView.vue'
 
 const mocks = vi.hoisted(() => ({
   api: vi.fn(),
+  connectRealtime: vi.fn(),
+  stopRealtime: vi.fn(),
 }))
 
-vi.mock('../lib/api', () => ({ api: mocks.api }))
-vi.mock('../lib/realtime', () => ({ connectChallengeRealtime: () => () => {} }))
+vi.mock('../lib/api', () => ({ api: mocks.api, ApiError: class extends Error { constructor(message: string, public status: number) { super(message) } }, signIn: vi.fn() }))
+vi.mock('../lib/realtime', () => ({ connectChallengeRealtime: mocks.connectRealtime }))
+const testRoute = reactive({ params: { id: 'challenge-1' }, path: '/challenges/challenge-1', query: {} as Record<string, string> })
 vi.mock('vue-router', () => ({
-  useRoute: () => ({ params: { id: 'challenge-1' } }),
-  useRouter: () => ({ push: vi.fn() }),
+  useRoute: () => testRoute,
+  useRouter: () => ({
+    push: vi.fn(async (location) => { if (typeof location !== 'string') testRoute.query = location.query }),
+    replace: vi.fn(async (location) => { testRoute.query = location.query }),
+  }),
 }))
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 
@@ -36,11 +42,14 @@ let rules: object[] = []
 let nationalTeams: object[] = []
 let nationalMilestoneSeason: number | null = null
 let nationalMilestoneValid = false
+let careerRequiresStartingStatus = false
+let careerStartingStatus: 'Unemployed' | 'Club' | null = null
 let wrapper: ReturnType<typeof shallowMount> | undefined
 let client: QueryClient | undefined
 
 function mountChallenge() {
-  mocks.api.mockImplementation(async (path: string) => {
+  mocks.connectRealtime.mockImplementation(() => mocks.stopRealtime)
+  mocks.api.mockImplementation(async (path: string, init?: RequestInit) => {
     const resource = path.split('/').at(-1) ?? ''
     if (failures.has(resource)) throw new Error(`${resource} unavailable`)
     if (resource === 'dashboard') return dashboard
@@ -50,6 +59,11 @@ function mountChallenge() {
       clubs, nationalTeam20MatchSeasonIndex: nationalMilestoneSeason, nationalTeamMilestoneVersion: 0,
       nationalTeamMilestoneValid: nationalMilestoneValid,
       threeContinentsSeasonIndex: null, threeContinentsMilestoneVersion: 3, threeContinentsMilestoneValid: false,
+      requiresStartingStatus: careerRequiresStartingStatus, startingStatus: careerStartingStatus, startingStintId: null,
+    }
+    if (path.endsWith('/career/start') && init?.method === 'PUT') {
+      careerStartingStatus = JSON.parse(String(init.body)).status
+      return undefined
     }
     if (path.startsWith('/api/clubs?')) return catalogClubs
     if (resource === 'geography') return {
@@ -71,6 +85,11 @@ function mountChallenge() {
         Dialog: { props: ['visible'], template: '<div v-if="visible"><slot /></div>' },
         InputText: { props: ['modelValue'], emits: ['update:modelValue'], template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" />' },
         InputNumber: { props: ['modelValue'], emits: ['update:modelValue'], template: '<input type="number" :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value === \'\' ? null : Number($event.target.value))" />' },
+        SeasonSelect: {
+          props: ['modelValue'],
+          emits: ['update:modelValue'],
+          template: '<select :value="modelValue ?? \'\'" @change="$emit(\'update:modelValue\', $event.target.value === \'\' ? null : Number($event.target.value))"><option value="">Not recorded</option><option v-for="index in 101" :key="index" :value="index - 1">{{ index }}</option></select>',
+        },
         Tag: { props: ['value'], template: '<span>{{ value }}</span>' },
       },
     },
@@ -98,10 +117,121 @@ afterEach(() => {
   nationalTeams = []
   nationalMilestoneSeason = null
   nationalMilestoneValid = false
+  careerRequiresStartingStatus = false
+  careerStartingStatus = null
   mocks.api.mockReset()
+  mocks.connectRealtime.mockReset()
+  mocks.stopRealtime.mockReset()
+  testRoute.query = {}
 })
 
 describe('challenge loading and errors', () => {
+  it('does not subscribe to a challenge during loading or after access fails', async () => {
+    const view = mountChallenge()
+    expect(mocks.connectRealtime).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(mocks.connectRealtime).toHaveBeenCalledTimes(1))
+    failures.add('dashboard')
+    await client!.invalidateQueries({ queryKey: ['challenge', 'challenge-1'] })
+    await vi.waitFor(() => expect(view.text()).toContain('dashboard unavailable'))
+    expect(mocks.stopRealtime).toHaveBeenCalled()
+    expect(view.find('.connection-indicator').exists()).toBe(false)
+  })
+  it.each(['PendingPlayers', 'Active', 'Completed', 'Archived'])('retains a URL-backed Seasons view in %s without exposing ineligible edits', async status => {
+    dashboard.challenge.status = status
+    careerRequiresStartingStatus = true
+    testRoute.query = { section: 'seasons' }
+    try {
+      const view = mountChallenge()
+      await vi.waitFor(() => expect(view.text()).toContain('No seasons recorded yet.'))
+      expect(testRoute.query.section).toBe('seasons')
+      expect(view.find('button-stub[label="Update season"]').exists()).toBe(false)
+    } finally { dashboard.challenge.status = 'Active' }
+  })
+
+  it.each(['PendingPlayers', 'Active'])('blocks country evidence in %s before career start without blocking initial club setup', async status => {
+    dashboard.challenge.status = status
+    careerRequiresStartingStatus = true
+    clubs = [{ id: 'club-1', clubName: 'Initial club', countryCode: 'PT', initialDivisionLevel: 2, officialMatches: 0, startSeasonIndex: 0 }]
+    try {
+      const view = mountChallenge()
+      await vi.waitFor(() => expect(view.text()).toContain('Set up your career start'))
+      await selectTab('Career')
+      expect(view.find('[aria-label="Edit Initial club"]').exists()).toBe(true)
+      expect(view.find('[aria-label="Set country milestone for Initial club"]').exists()).toBe(false)
+      expect(view.find('.calculated-milestones').exists()).toBe(false)
+    } finally { dashboard.challenge.status = 'Active' }
+  })
+
+  it('keeps country evidence writable for an active legacy career and closes stale dialogs on archive', async () => {
+    clubs = [{ id: 'club-1', clubName: 'Initial club', countryCode: 'PT', initialDivisionLevel: 2, officialMatches: 20, startSeasonIndex: 0 }]
+    const view = mountChallenge()
+    await vi.waitFor(() => expect(view.text()).toContain('Test challenge'))
+    await selectTab('Career')
+    await view.get('[aria-label="Set country milestone for Initial club"]').trigger('click')
+    expect(view.find('form').text()).toContain('Country 20th-match season')
+    client!.setQueryData(['challenge', 'challenge-1'], { ...dashboard, challenge: { ...dashboard.challenge, status: 'Archived' } })
+    await vi.waitFor(() => expect(view.find('form').exists()).toBe(false))
+    expect(testRoute.query.section).toBe('career')
+    dashboard.challenge.status = 'Active'
+  })
+
+  it('retains read navigation but hides gameplay entry until career start is recorded', async () => {
+    careerRequiresStartingStatus = true
+    const view = mountChallenge()
+    await vi.waitFor(() => expect(view.text()).toContain('Set up your career start'))
+    const navText = view.findAll('nav button').map(button => button.text()).join(' ')
+    expect(navText).toContain('Overview')
+    expect(navText).toContain('Career')
+    expect(navText).toContain('Rules')
+    expect(navText).toContain('Seasons')
+    expect(navText).toContain('Achievements')
+    expect(navText).toContain('Transfers')
+    expect(view.find('button-stub[label="Update season"]').exists()).toBe(false)
+    expect(view.find('.career-setup-banner button-stub.primary-button').exists()).toBe(true)
+  })
+
+  it('unlocks gameplay after saving an unemployed career start', async () => {
+    careerRequiresStartingStatus = true
+    const view = mountChallenge()
+    await vi.waitFor(() => expect(view.text()).toContain('Set up your career start'))
+    await selectTab('Career')
+    await view.find('button-stub[label="Set career start"]').trigger('click')
+    const form = view.findAll('form').find(item => item.text().includes('Starting situation'))!
+    await form.get('select').setValue('Unemployed')
+    await form.trigger('submit')
+    await vi.waitFor(() => expect(view.findAll('nav button').map(button => button.text()).join(' ')).toContain('Seasons'))
+    expect(careerStartingStatus).toBe('Unemployed')
+    expect(view.findAll('nav button').map(button => button.text()).join(' ')).toContain('Achievements')
+  })
+
+  it('lets a manager add the required starting club before saving career start', async () => {
+    careerRequiresStartingStatus = true
+    const view = mountChallenge()
+    await vi.waitFor(() => expect(view.text()).toContain('Set up your career start'))
+    await selectTab('Career')
+    await view.find('button-stub[label="Set career start"]').trigger('click')
+    const startForm = view.findAll('form').find(item => item.text().includes('Starting situation'))!
+    await startForm.get('select').setValue('Club')
+    await startForm.find('button-stub[label="Add starting club"]').trigger('click')
+    expect(view.findAll('form')).toHaveLength(1)
+    expect(view.find('form').text()).toContain('Search club catalog')
+  })
+
+  it('keeps completed legacy careers readable without a required career-start value', async () => {
+    dashboard.challenge.status = 'Completed'
+    careerRequiresStartingStatus = true
+    try {
+      const view = mountChallenge()
+      await vi.waitFor(() => expect(view.text()).toContain('Challenge complete.'))
+      expect(view.findAll('nav button').map(button => button.text()).join(' ')).toContain('Seasons')
+      await selectTab('Seasons')
+      expect(view.text()).toContain('No seasons recorded yet.')
+      expect(view.text()).not.toContain('Record a season')
+    } finally {
+      dashboard.challenge.status = 'Active'
+    }
+  })
+
   it('does not expose administrator lifecycle actions to a participant', async () => {
     dashboard.challenge.status = 'Completed'
     dashboard.participants[0].role = 'Participant'
@@ -311,7 +441,7 @@ describe('challenge loading and errors', () => {
   it.each([
     ['G040', 'This was my first major trophy with this club.', 'The trophy was not a super cup.'],
     ['G048', 'I had won at least ten major trophies by this season.', ''],
-    ['G050', 'Season index managing this club in the third division', 'I stayed with the same club from the third division until reaching the first.'],
+    ['G050', 'Season managed in the third division', 'I stayed with the same club from the third division until reaching the first.'],
     ['G051', 'I won the official Football Manager Manager of the Year award.', ''],
   ])('asks for %s achievement evidence', async (code, condition, secondCondition) => {
     achievements = [{
@@ -341,8 +471,8 @@ describe('challenge loading and errors', () => {
     await view.find('.achievement-add').trigger('click')
     const form = view.findAll('form').find(item => item.text().includes('Competition type'))!
     const selects = form.findAll('select')
-    await selects[0]!.setValue('NationalWorld')
-    await selects[1]!.setValue('Winner')
+    await selects[1]!.setValue('NationalWorld')
+    await selects[2]!.setValue('Winner')
     await form.trigger('submit')
     await vi.waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
       '/api/challenges/challenge-1/achievement-claims',
@@ -365,7 +495,7 @@ describe('challenge loading and errors', () => {
     await view.find('.achievement-add').trigger('click')
     expect(view.text()).toContain('Second title club (required)')
     expect(view.text()).toContain('First title club country code')
-    expect(view.text()).toContain('First title season index')
+    expect(view.text()).toContain('First title season')
     expect(view.text()).toContain('I won a continental club trophy with each club.')
   })
 
@@ -464,7 +594,7 @@ describe('challenge loading and errors', () => {
     await selectTab('Career')
     await vi.waitFor(() => expect(view.text()).toContain('First Club'))
     await view.find('button[aria-label="Edit First Club"]').trigger('click')
-    expect(view.text()).toContain('Ending season index (optional)')
+    expect(view.text()).toContain('Ending season (optional)')
     await view.find('button[aria-label="Remove First Club"]').trigger('click')
     await vi.waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
       '/api/challenges/challenge-1/career/stints/club-1?version=4', { method: 'DELETE' },
@@ -523,7 +653,7 @@ describe('challenge loading and errors', () => {
     await vi.waitFor(() => expect(view.find('.achievement-add').exists()).toBe(true))
     await view.find('.achievement-add').trigger('click')
     const form = view.findAll('form').find(item => item.text().includes('Career club (optional)'))!
-    expect(form.get('select').text()).toContain('Shared Club · Women · PT')
+    expect(form.findAll('label').find(label => label.text().includes('Career club (optional)'))!.get('select').text()).toContain('Shared Club · Women · PT')
   })
 
   it('links an achievement to the selected catalog club in the career', async () => {
@@ -542,7 +672,7 @@ describe('challenge loading and errors', () => {
     await vi.waitFor(() => expect(view.find('.achievement-add').exists()).toBe(true))
     await view.find('.achievement-add').trigger('click')
     const form = view.findAll('form').find(item => item.text().includes('Career club (optional)'))!
-    await form.get('select').setValue('club-1')
+    await form.findAll('label').find(label => label.text().includes('Career club (optional)'))!.get('select').setValue('club-1')
     expect(form.text()).toContain('This achievement is linked to a catalog club.')
     await form.trigger('submit')
     await vi.waitFor(() => {
@@ -587,6 +717,36 @@ describe('challenge loading and errors', () => {
         clubId: 'next-catalog',
       })
     })
+  })
+
+  it('saves a new season at the supported upper boundary with a zero-based identity', async () => {
+    dashboard.challenge.status = 'Active'
+    const view = mountChallenge()
+    await vi.waitFor(() => expect(view.text()).toContain('Test challenge'))
+    await selectTab('Seasons')
+    await vi.waitFor(() => expect(view.text()).toContain('No seasons recorded yet.'))
+    await view.get('button-stub.primary-button').trigger('click')
+    const label = view.findAll('label').find(item => item.text().startsWith('FM season'))!
+    await label.get('select').setValue('100')
+    await view.get('form').trigger('submit')
+    await vi.waitFor(() => expect(mocks.api.mock.calls.some(([path, init]) => path.endsWith('/seasons/100') && init?.method === 'PUT')).toBe(true))
+    const call = mocks.api.mock.calls.find(([path]) => path.endsWith('/seasons/100'))!
+    expect(JSON.parse(call[1].body)).toMatchObject({ version: null, usesClubBreakdown: false, currency: 'EUR' })
+  })
+
+  it('rejects an existing season selected from new entry rather than overwriting its saved version', async () => {
+    dashboard.challenge.status = 'Active'
+    seasons = [{ id: 'saved-0', seasonIndex: 0, status: 'Completed', displayName: '2026/27', version: 4, currency: 'EUR' }]
+    const view = mountChallenge()
+    await vi.waitFor(() => expect(view.text()).toContain('Test challenge'))
+    await selectTab('Seasons')
+    await vi.waitFor(() => expect(view.text()).toContain('2026/27'))
+    await view.get('button-stub.primary-button').trigger('click')
+    const label = view.findAll('label').find(item => item.text().startsWith('FM season'))!
+    await label.get('select').setValue('0')
+    await view.get('form').trigger('submit')
+    expect(view.text()).toContain('This season already exists. Cancel and edit its saved record from Seasons.')
+    expect(mocks.api.mock.calls.some(([path, init]) => path.endsWith('/seasons/0') && init?.method === 'PUT')).toBe(false)
   })
 
   it('saves a detailed season using a career stint and explicit mode', async () => {
@@ -699,8 +859,8 @@ describe('challenge loading and errors', () => {
     await selectTab('Career')
     await vi.waitFor(() => expect(view.text()).toContain('Three continents'))
     await view.find('button-stub[label="Set continent milestone"]').trigger('click')
-    const form = view.findAll('form').find(item => item.text().includes('Third continent season index'))!
-    await form.find('input[type="number"]').setValue('2')
+    const form = view.findAll('form').find(item => item.text().includes('Third continent season'))!
+    await form.get('select').setValue('2')
     await form.trigger('submit')
     await vi.waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
       '/api/challenges/challenge-1/career/three-continents-milestone',
@@ -763,7 +923,7 @@ describe('challenge loading and errors', () => {
     await selectTab('Career')
     await vi.waitFor(() => expect(view.text()).toContain('MILESTONE SEASON NEEDED'))
     await view.find('button[aria-label="Update matches for First Club"]').trigger('click')
-    const form = view.findAll('form').find(item => item.text().includes('Season index when the club reached 20 matches'))!
+    const form = view.findAll('form').find(item => item.text().includes('Season the club reached 20 matches'))!
     expect(form.text()).toContain('Without either, the milestone remains pending.')
     await form.trigger('submit')
     await vi.waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
@@ -784,9 +944,8 @@ describe('challenge loading and errors', () => {
     await vi.waitFor(() => expect(view.text()).toContain('20 across club stints'))
     expect(view.text()).toContain('MILESTONE SEASON NEEDED')
     await view.find('button[aria-label="Update matches for Return Club"]').trigger('click')
-    const form = view.findAll('form').find(item => item.text().includes('Season index when the club reached 20 matches'))!
-    const inputs = form.findAll('input[type="number"]')
-    await inputs[1]!.setValue('2')
+    const form = view.findAll('form').find(item => item.text().includes('Season the club reached 20 matches'))!
+    await form.get('select').setValue('2')
     await form.trigger('submit')
     await vi.waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
       '/api/challenges/challenge-1/career/stints/return-1/matches',
@@ -835,8 +994,8 @@ describe('challenge loading and errors', () => {
     await selectTab('Career')
     await vi.waitFor(() => expect(view.text()).toContain('20 in Spain'))
     await view.find('button[aria-label="Set country milestone for Foreign Club"]').trigger('click')
-    const form = view.findAll('form').find(item => item.text().includes('Country 20th-match season index'))!
-    await form.get('input[type="number"]').setValue('2')
+    const form = view.findAll('form').find(item => item.text().includes('Country 20th-match season'))!
+    await form.get('select').setValue('2')
     await form.trigger('submit')
     await vi.waitFor(() => expect(mocks.api).toHaveBeenCalledWith(
       '/api/challenges/challenge-1/career/stints/foreign-1/country-milestone',
@@ -915,9 +1074,9 @@ describe('challenge loading and errors', () => {
     await vi.waitFor(() => expect(view.text()).toContain('Test challenge'))
     await selectTab('Achievements')
     await view.find('button-stub.achievement-add').trigger('click')
-    const form = view.findAll('form').find(item => item.text().includes('FM season index'))!
+    const form = view.findAll('form').find(item => item.text().includes('FM season'))!
     expect(form.text()).toContain('Club, if applicable')
-    await form.get('input[type="number"]').setValue('2')
+    await form.get('select').setValue('2')
     expect(form.text()).toContain('Club (required)')
     expect(form.findAll('label').find(item => item.text().includes('Cup matches you managed'))!.get('input').attributes('min')).toBe('4')
   })

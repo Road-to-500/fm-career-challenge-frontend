@@ -1,3 +1,5 @@
+import { rememberInvitation } from './invitationIntent'
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -58,6 +60,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export function signIn(): void {
+  rememberInvitation()
   window.location.assign(`${apiBase}/api/auth/google`)
 }
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, defineAsyncComponent, onUnmounted, reactive, ref, watch } from 'vue'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { ArrowLeft, ArrowUpRight, BadgeCheck, CalendarDays, ChevronRight, CirclePlus, Clock3, Flag, Medal, Plus, Radio, Settings2, Shield, Trophy, Users } from '@lucide/vue'
 import { useForm } from 'vee-validate'
@@ -12,9 +12,11 @@ import InputText from 'primevue/inputtext'
 import ProgressBar from 'primevue/progressbar'
 import Tag from 'primevue/tag'
 import { useRoute, useRouter } from 'vue-router'
-import { api } from '../lib/api'
+import { api, ApiError, signIn } from '../lib/api'
 import { connectChallengeRealtime } from '../lib/realtime'
 import ThemeToggle from '../components/ThemeToggle.vue'
+import FieldHelp from '../components/FieldHelp.vue'
+import SeasonSelect from '../components/SeasonSelect.vue'
 
 const ScoreTimelineChart = defineAsyncComponent(() => import('../components/ScoreTimelineChart.vue'))
 
@@ -296,7 +298,16 @@ const router = useRouter()
 const { t } = useI18n()
 const queryClient = useQueryClient()
 const challengeId = String(route.params.id)
-const activeTab = ref('Overview')
+const sectionNames = ['Overview', 'Career', 'Seasons', 'Achievements', 'Transfers', 'Activity', 'Rules']
+const activeTab = computed({
+  get: () => sectionNames.find(section => section.toLowerCase() === route.query.section) ?? 'Overview',
+  set: (section: string) => {
+    const query = { ...route.query }
+    if (section === 'Overview') delete query.section
+    else query.section = section.toLowerCase()
+    void router.push({ path: route.path, query, hash: '' })
+  },
+})
 const connectionStatus = ref(false)
 const clubDialogVisible = ref(false)
 const careerStartDialogVisible = ref(false)
@@ -441,6 +452,8 @@ const nationalTeamDialogVisible = ref(false)
 const selectedNationalTeam = ref<NationalTeam>()
 const nationalTeamError = ref('')
 const nationalMilestoneDialogVisible = ref(false)
+// A previous close animation must not tear down a quickly reopened milestone dialog.
+const nationalMilestoneDialogSession = ref(0)
 const nationalMilestoneSeason = ref<number | null>(null)
 const nationalMilestoneVersion = ref(0)
 const nationalMilestoneError = ref('')
@@ -525,6 +538,7 @@ const activityQuery = useQuery({
 })
 
 const challenge = computed(() => challengeQuery.data.value?.challenge)
+const challengeStartYear = computed(() => challenge.value?.startSeasonYear ?? 2026)
 const participants = computed(() => challengeQuery.data.value?.participants ?? [])
 const me = computed(() => participants.value.find(item => item.isCurrentUser))
 const challengeInvitesQuery = useQuery({
@@ -601,11 +615,74 @@ const currentSeasonIndex = computed(() => {
 })
 const isRulesReadOnly = computed(() => ['Completed', 'Archived'].includes(challenge.value?.status ?? ''))
 const isReadOnly = computed(() => isRulesReadOnly.value || challenge.value?.status === 'Draft')
-onMounted(() => {
+const careerStartNeedsSetup = computed(() => {
+  const career = careerQuery.data.value
+  return careerQuery.isSuccess.value && Boolean(career?.requiresStartingStatus && !career.startingStatus)
+    && ['Active', 'PendingPlayers'].includes(challenge.value?.status ?? '')
+})
+const canManageCareer = computed(() => careerQuery.isSuccess.value && !isReadOnly.value
+  && ['Active', 'PendingPlayers'].includes(challenge.value?.status ?? ''))
+const canRecordGameplay = computed(() => careerQuery.isSuccess.value
+  && challenge.value?.status === 'Active' && !isReadOnly.value && !careerStartNeedsSetup.value)
+const canViewGameplay = computed(() => ['Completed', 'Archived', 'Active', 'PendingPlayers'].includes(challenge.value?.status ?? ''))
+const primaryTabs = computed(() => [
+  'Overview',
+  'Career',
+  ...(canViewGameplay.value ? ['Seasons', 'Achievements'] : []),
+])
+const moreTabs = computed(() => [
+  ...(challenge.value?.status !== 'Draft' ? ['Activity'] : []),
+  ...(canViewGameplay.value ? ['Transfers'] : []),
+  'Rules',
+])
+const seasonChoiceMaxIndex = 100
+watch([() => route.query.section, () => challenge.value?.status], () => {
+  if (!challenge.value) return
+  const available = [...primaryTabs.value, ...moreTabs.value]
+  if (route.query.section && (!sectionNames.some(section => section.toLowerCase() === route.query.section)
+    || !available.includes(activeTab.value))) {
+    const query = { ...route.query }
+    delete query.section
+    void router.replace({ path: route.path, query, hash: '' })
+  }
+}, { immediate: true })
+watch(() => route.query.section, () => {
+  clubDialogVisible.value = false
+  careerStartDialogVisible.value = false
+  clubMatchesDialogVisible.value = false
+  countryMilestoneDialogVisible.value = false
+  seasonDialogVisible.value = false
+  achievementDialogVisible.value = false
+  transferDialogVisible.value = false
+  nationalTeamDialogVisible.value = false
+  nationalMilestoneDialogVisible.value = false
+  continentsMilestoneDialogVisible.value = false
+})
+watch(canManageCareer, (allowed) => {
+  if (allowed) return
+  clubDialogVisible.value = false
+  careerStartDialogVisible.value = false
+  clubMatchesDialogVisible.value = false
+})
+watch(canRecordGameplay, (allowed) => {
+  if (allowed) return
+  seasonDialogVisible.value = false
+  achievementDialogVisible.value = false
+  transferDialogVisible.value = false
+  nationalTeamDialogVisible.value = false
+  nationalMilestoneDialogVisible.value = false
+  continentsMilestoneDialogVisible.value = false
+  countryMilestoneDialogVisible.value = false
+}, { immediate: true })
+watch(() => challengeQuery.isSuccess.value, available => {
+  stopRealtime?.()
+  stopRealtime = undefined
+  connectionStatus.value = false
+  if (!available) return
   stopRealtime = connectChallengeRealtime(challengeId, queryClient, connected => {
     connectionStatus.value = connected
   })
-})
+}, { immediate: true })
 
 onUnmounted(() => stopRealtime?.())
 
@@ -751,7 +828,11 @@ function selectFirstTitleCareerClub(event: Event) {
   participation.firstContinentalTitleCountry = stint.countryCode
 }
 
+let addingCareerStartClub = false
+
 function openClub(club?: Career['clubs'][number]) {
+  if (!canManageCareer.value) return
+  addingCareerStartClub = false
   editingClub.value = club
   clubForm.resetForm({ values: {
     clubName: club?.clubName ?? '', countryName: club?.countryName ?? '', countryCode: club?.countryCode ?? '',
@@ -779,6 +860,7 @@ function selectCatalogClub(event: Event) {
 }
 
 async function createCatalogClub() {
+  if (saving.value || !canManageCareer.value) return
   formError.value = ''
   saving.value = true
   try {
@@ -800,6 +882,8 @@ async function createCatalogClub() {
 }
 
 async function submitClub() {
+  if (saving.value) return
+  if (!canManageCareer.value) return
   formError.value = ''
   const validation = clubSchema.safeParse(clubForm.values)
   if (!validation.success) {
@@ -808,6 +892,7 @@ async function submitClub() {
   }
   saving.value = true
   try {
+    const previousClubIds = new Set(allClubs.value.map(club => club.id))
     await api(`/api/challenges/${challengeId}/career/stints${editingClub.value ? `/${editingClub.value.id}` : ''}`, {
       method: editingClub.value ? 'PUT' : 'POST',
       body: JSON.stringify({ ...validation.data, version: editingClub.value?.version ?? null,
@@ -816,6 +901,13 @@ async function submitClub() {
     })
     clubDialogVisible.value = false
     await invalidateChallenge()
+    if (addingCareerStartClub && canManageCareer.value) {
+      addingCareerStartClub = false
+      openCareerStart()
+      careerStartStatus.value = 'Club'
+      careerStartStintId.value = allClubs.value.find(club => !previousClubIds.has(club.id)
+        && club.initialDivisionLevel > 1)?.id ?? ''
+    }
   } catch (error) {
     formError.value = error instanceof Error ? error.message : 'Club could not be saved.'
   } finally {
@@ -824,6 +916,8 @@ async function submitClub() {
 }
 
 async function deleteClub(club: Career['clubs'][number]) {
+  if (saving.value) return
+  if (!canManageCareer.value) return
   if (!window.confirm(`Remove ${careerClubLabel(club)} from your career? This may change milestones and scores.`)) return
   clubActionError.value = ''
   saving.value = true
@@ -838,6 +932,7 @@ async function deleteClub(club: Career['clubs'][number]) {
 }
 
 function openClubMatches(club: Career['clubs'][number]) {
+  if (!canManageCareer.value) return
   selectedClub.value = club
   updatedClubMatches.value = club.officialMatches
   updatedEligibleSeason.value = club.eligibleSeasonIndex
@@ -846,6 +941,8 @@ function openClubMatches(club: Career['clubs'][number]) {
 }
 
 async function submitClubMatches() {
+  if (!canManageCareer.value || saving.value) return
+  if (!canManageCareer.value) return
   if (!selectedClub.value) return
   formError.value = ''
   saving.value = true
@@ -868,6 +965,7 @@ async function submitClubMatches() {
 }
 
 function openCountryMilestone(club: Career['clubs'][number]) {
+  if (!canRecordGameplay.value || saving.value) return
   selectedClub.value = club
   countryMilestoneSeason.value = club.countryEligibleSeasonIndex
   formError.value = ''
@@ -875,6 +973,7 @@ function openCountryMilestone(club: Career['clubs'][number]) {
 }
 
 async function submitCountryMilestone() {
+  if (!canRecordGameplay.value || saving.value) return
   if (!selectedClub.value) return
   formError.value = ''
   saving.value = true
@@ -893,6 +992,7 @@ async function submitCountryMilestone() {
 }
 
 function openSeasonDialog(season?: Season) {
+  if (!canRecordGameplay.value) return
   const selected = season ?? allSeasons.value.find(item => item.seasonIndex === currentSeasonIndex.value)
   selectedSeasonIndex.value = selected?.seasonIndex ?? currentSeasonIndex.value
   selectedSeasonVersion.value = selected?.version ?? null
@@ -920,7 +1020,17 @@ function openSeasonDialog(season?: Season) {
 }
 
 async function submitSeason() {
+  if (!canRecordGameplay.value) return
+  if (saving.value) return
   formError.value = ''
+  if (!Number.isInteger(selectedSeasonIndex.value) || selectedSeasonIndex.value < 0 || selectedSeasonIndex.value > 100) {
+    formError.value = 'Choose a supported FM season.'
+    return
+  }
+  if (selectedSeasonVersion.value === null && allSeasons.value.some(season => season.seasonIndex === selectedSeasonIndex.value)) {
+    formError.value = 'This season already exists. Cancel and edit its saved record from Seasons.'
+    return
+  }
   const validation = seasonSchema.safeParse(seasonForm.values)
   if (!validation.success) {
     formError.value = validation.error.issues[0]?.message ?? 'Check the season statistics.'
@@ -971,6 +1081,7 @@ async function submitSeason() {
 }
 
 function openAchievement(achievement: Achievement, claim?: AchievementClaim) {
+  if (!canRecordGameplay.value) return
   selectedAchievement.value = achievement
   selectedClaim.value = claim
   selectedClaimClub.value = claim?.clubId
@@ -1037,6 +1148,8 @@ function openAchievement(achievement: Achievement, claim?: AchievementClaim) {
 }
 
 async function submitAchievement() {
+  if (saving.value) return
+  if (!canRecordGameplay.value) return
   if (!selectedAchievement.value) return
   formError.value = ''
   if (supportsCompetition.value && !competitionsQuery.isSuccess.value) {
@@ -1139,6 +1252,8 @@ async function submitAchievement() {
 }
 
 async function deleteAchievement(achievement: Achievement, claim: AchievementClaim) {
+  if (saving.value) return
+  if (!canRecordGameplay.value) return
   if (!window.confirm(`Remove ${achievement.name} for ${seasonName(claim.seasonIndex)}? This will recalculate the score.`)) return
   claimActionError.value = ''
   saving.value = true
@@ -1153,6 +1268,7 @@ async function deleteAchievement(achievement: Achievement, claim: AchievementCla
 }
 
 function openTransfer(transfer?: Transfer) {
+  if (!canRecordGameplay.value) return
   selectedTransfer.value = transfer
   const season = allSeasons.value.find(item => item.seasonIndex === currentSeasonIndex.value) ?? allSeasons.value.at(-1)
   Object.assign(transferForm, {
@@ -1167,6 +1283,8 @@ function openTransfer(transfer?: Transfer) {
 }
 
 async function submitTransfer() {
+  if (saving.value) return
+  if (!canRecordGameplay.value) return
   transferError.value = ''
   const validation = z.object({
     seasonIndex: z.number().int().min(0).max(100),
@@ -1198,6 +1316,8 @@ async function submitTransfer() {
 }
 
 async function deleteTransfer(transfer: Transfer) {
+  if (saving.value) return
+  if (!canRecordGameplay.value) return
   if (!window.confirm(`Remove the transfer for ${transfer.playerName}? This will recalculate the score.`)) return
   transferError.value = ''
   saving.value = true
@@ -1212,6 +1332,7 @@ async function deleteTransfer(transfer: Transfer) {
 }
 
 function openNationalTeam(team?: NationalTeam) {
+  if (!canRecordGameplay.value) return
   selectedNationalTeam.value = team
   Object.assign(nationalTeamForm, {
     teamName: team?.teamName ?? '', countryCode: team?.countryCode ?? '', startSeasonIndex: team?.startSeasonIndex ?? currentSeasonIndex.value,
@@ -1241,6 +1362,8 @@ function removeNationalSeasonMatches(index: number) {
 }
 
 async function submitNationalTeam() {
+  if (saving.value) return
+  if (!canRecordGameplay.value) return
   nationalTeamError.value = ''
   const validation = z.object({
     teamName: z.string().trim().min(1).max(120),
@@ -1281,6 +1404,8 @@ async function submitNationalTeam() {
 }
 
 async function deleteNationalTeam(team: NationalTeam) {
+  if (saving.value) return
+  if (!canRecordGameplay.value) return
   if (!window.confirm(`Remove the national team stint with ${team.teamName}?`)) return
   nationalTeamError.value = ''
   saving.value = true
@@ -1295,6 +1420,7 @@ async function deleteNationalTeam(team: NationalTeam) {
 }
 
 function openCareerStart() {
+  if (!canManageCareer.value) return
   const career = careerQuery.data.value
   careerStartStatus.value = career?.startingStatus ?? 'Unemployed'
   careerStartStintId.value = career?.startingStintId ?? ''
@@ -1303,7 +1429,15 @@ function openCareerStart() {
   careerStartDialogVisible.value = true
 }
 
+function addStartingClub() {
+  careerStartDialogVisible.value = false
+  openClub()
+  addingCareerStartClub = true
+}
+
 async function saveCareerStart() {
+  if (saving.value) return
+  if (!canManageCareer.value) return
   careerStartError.value = ''
   saving.value = true
   try {
@@ -1325,6 +1459,8 @@ async function saveCareerStart() {
 }
 
 function openNationalMilestone() {
+  if (!canRecordGameplay.value) return
+  nationalMilestoneDialogSession.value++
   nationalMilestoneSeason.value = careerQuery.data.value?.nationalTeam20MatchSeasonIndex ?? null
   nationalMilestoneVersion.value = careerQuery.data.value?.nationalTeamMilestoneVersion ?? 0
   nationalMilestoneError.value = ''
@@ -1332,6 +1468,8 @@ function openNationalMilestone() {
 }
 
 async function saveNationalMilestone() {
+  if (saving.value) return
+  if (!canRecordGameplay.value) return
   nationalMilestoneError.value = ''
   saving.value = true
   try {
@@ -1349,6 +1487,7 @@ async function saveNationalMilestone() {
 }
 
 function openContinentsMilestone() {
+  if (!canRecordGameplay.value) return
   continentsMilestoneSeason.value = careerQuery.data.value?.threeContinentsSeasonIndex ?? null
   continentsMilestoneVersion.value = careerQuery.data.value?.threeContinentsMilestoneVersion ?? 0
   continentsMilestoneError.value = ''
@@ -1356,6 +1495,8 @@ function openContinentsMilestone() {
 }
 
 async function saveContinentsMilestone() {
+  if (saving.value) return
+  if (!canRecordGameplay.value) return
   continentsMilestoneError.value = ''
   saving.value = true
   try {
@@ -1373,6 +1514,8 @@ async function saveContinentsMilestone() {
 }
 
 async function inviteRival() {
+  if (saving.value) return
+  saving.value = true
   invitationMessage.value = ''
   heroInviteUrl.value = ''
   try {
@@ -1389,10 +1532,13 @@ async function inviteRival() {
     }
   } catch (error) {
     invitationMessage.value = error instanceof Error ? error.message : 'Invitation could not be created.'
+  } finally {
+    saving.value = false
   }
 }
 
 async function createManagedInvite() {
+  if (saving.value) return
   inviteManagementError.value = ''
   createdInviteUrl.value = ''
   saving.value = true
@@ -1412,6 +1558,7 @@ async function createManagedInvite() {
 }
 
 async function revokeInvite(invitation: ChallengeInvite) {
+  if (saving.value) return
   if (!window.confirm('Revoke this invitation? Its link can no longer be used.')) return
   inviteManagementError.value = ''
   saving.value = true
@@ -1426,6 +1573,7 @@ async function revokeInvite(invitation: ChallengeInvite) {
 }
 
 async function changeCorrectionMode(reopen: boolean) {
+  if (saving.value) return
   const message = reopen
     ? 'Reopen this completed challenge for corrections? The winner will be cleared until corrections are finished.'
     : 'Finish corrections and recalculate the final result?'
@@ -1446,6 +1594,7 @@ async function changeCorrectionMode(reopen: boolean) {
 }
 
 async function changeArchive(archive: boolean) {
+  if (saving.value) return
   const prompt = archive
     ? 'Archive this challenge? It becomes read-only and pending invitations are revoked.'
     : 'Restore this challenge to its previous status? Revoked invitations will not be restored.'
@@ -1465,6 +1614,7 @@ async function changeArchive(archive: boolean) {
 }
 
 async function publishDraft() {
+  if (saving.value) return
   if (!challenge.value || challenge.value.status !== 'Draft') return
   archiveError.value = ''
   saving.value = true
@@ -1521,6 +1671,7 @@ function ruleChangePayload() {
 }
 
 async function previewRuleChange() {
+  if (saving.value) return
   ruleError.value = ''
   saving.value = true
   try {
@@ -1538,6 +1689,7 @@ async function previewRuleChange() {
 }
 
 async function applyRuleChange() {
+  if (saving.value) return
   const payload = ruleChangePayload()
   if (!rulePreview.value || JSON.stringify(payload) !== rulePreviewKey.value) {
     ruleError.value = 'Preview the current changes before applying them.'
@@ -1561,6 +1713,7 @@ async function applyRuleChange() {
 }
 
 async function createCustomAchievement() {
+  if (saving.value) return
   customAchievementError.value = ''
   saving.value = true
   try {
@@ -1592,6 +1745,7 @@ function editCompetition(competition?: Competition) {
 }
 
 async function saveCompetition() {
+  if (saving.value) return
   competitionError.value = ''
   saving.value = true
   try {
@@ -1610,6 +1764,7 @@ async function saveCompetition() {
 }
 
 async function deleteCompetition(competition: Competition) {
+  if (saving.value) return
   if (!window.confirm(`Remove ${competition.name} from this challenge? Competitions used by claims cannot be removed.`)) return
   competitionError.value = ''
   saving.value = true
@@ -1677,15 +1832,17 @@ function clubSeasonLabel(stintId: string) {
       <a class="brand" href="/dashboard" aria-label="FM Career Challenge home"><span class="brand-mark"><Trophy :size="18" /></span><span class="brand-copy">FM CAREER <span>CHALLENGE</span></span></a>
       <div class="challenge-top-actions">
         <ThemeToggle />
-        <span class="connection-indicator" :class="{ connected: connectionStatus }"><span class="online-dot"></span>{{ connectionStatus ? 'Live updates on' : 'Reconnecting' }}</span>
+        <span v-if="challengeQuery.isSuccess.value" class="connection-indicator" :class="{ connected: connectionStatus }"><span class="online-dot"></span>{{ connectionStatus ? 'Live updates on' : 'Reconnecting' }}</span>
         <Button class="outline-button" @click="router.push('/dashboard')"><ArrowLeft :size="15" /> Dashboard</Button>
       </div>
     </header>
 
     <div v-if="challengeQuery.isPending.value" class="challenge-loading"><span class="loading-spinner"></span> {{ t('challenge.loading') }}</div>
-    <div v-else-if="challengeQuery.isError.value" class="detail-error">
-      <strong>{{ t('challenge.unavailable') }}</strong>
+    <div v-else-if="challengeQuery.isError.value" class="detail-error" role="alert">
+      <strong>{{ challengeQuery.error.value instanceof ApiError && challengeQuery.error.value.status === 404 ? 'Challenge not found' : challengeQuery.error.value instanceof ApiError && challengeQuery.error.value.status === 403 ? 'You do not have access to this challenge' : challengeQuery.error.value instanceof ApiError && challengeQuery.error.value.status === 401 ? 'Sign in to view this challenge' : t('challenge.unavailable') }}</strong>
       <p>{{ challengeQuery.error.value?.message }}</p>
+      <Button v-if="challengeQuery.error.value instanceof ApiError && challengeQuery.error.value.status === 401" class="primary-button" @click="signIn()">Continue with Google</Button>
+      <Button v-else-if="!(challengeQuery.error.value instanceof ApiError) || ![403, 404].includes(challengeQuery.error.value.status)" class="outline-button" @click="() => challengeQuery.refetch()">Try again</Button>
       <Button class="outline-button" @click="router.push('/dashboard')">Back to dashboard</Button>
     </div>
 
@@ -1695,15 +1852,18 @@ function clubSeasonLabel(stintId: string) {
           <div class="challenge-hero-copy">
             <div class="hero-kicker"><span class="live-pulse"></span> {{ challenge.status.toUpperCase() }} <span class="hero-divider">/</span> RACE TO 500</div>
             <h1>{{ challenge.name }}</h1>
-            <p>{{ challenge.description || 'A career is measured in seasons, not speed. Make every one count.' }}</p>
+            <p v-if="challenge.description">{{ challenge.description }}</p>
             <div class="hero-meta"><span><CalendarDays :size="14" /> Started {{ challenge.startSeasonYear }}/{{ String((challenge.startSeasonYear + 1) % 100).padStart(2, '0') }}</span><span><Users :size="14" /> {{ participants.length }} of 2 managers</span></div>
           </div>
           <div class="hero-actions">
             <Button v-if="challenge.status === 'Draft' && me?.role === 'Administrator'" class="primary-button" :loading="saving" label="Publish draft" @click="publishDraft" />
-            <Button v-if="!rival && !isReadOnly && me?.role === 'Administrator'" class="invite-button" @click="inviteRival"><Users :size="16" /> Invite your rival</Button>
-            <Button v-if="me?.role === 'Administrator' && !challenge.isCorrectionMode" class="outline-button" :loading="saving" @click="changeArchive(challenge.status !== 'Archived')">{{ challenge.status === 'Archived' ? 'Restore challenge' : 'Archive challenge' }}</Button>
+            <Button v-if="!rival && !isReadOnly && me?.role === 'Administrator'" class="invite-button" :disabled="saving" @click="inviteRival"><Users :size="16" /> Invite your rival</Button>
+            <details v-if="me?.role === 'Administrator' && !challenge.isCorrectionMode" class="management-actions">
+              <summary>Manage challenge</summary>
+              <Button class="text-action" :disabled="saving" @click="changeArchive(challenge.status !== 'Archived')">{{ challenge.status === 'Archived' ? 'Restore challenge' : 'Archive challenge' }}</Button>
+            </details>
             <span v-if="invitationMessage" class="invitation-feedback" role="status">{{ invitationMessage }}</span>
-            <label v-if="heroInviteUrl && !rival">Invitation link <InputText :model-value="heroInviteUrl" readonly /></label>
+            <label v-if="heroInviteUrl && !rival">Invitation link <InputText :model-value="heroInviteUrl" readonly /><FieldHelp>Copy this private link and share it with your rival.</FieldHelp></label>
             <span v-if="archiveError" class="form-error" role="alert">{{ archiveError }}</span>
             <Tag v-if="isReadOnly" :value="challenge.status === 'Draft' ? 'CONFIGURATION ONLY' : 'READ ONLY'" severity="secondary" />
           </div>
@@ -1736,24 +1896,32 @@ function clubSeasonLabel(stintId: string) {
         <Button v-if="me?.role === 'Administrator'" class="text-action" :loading="saving" @click="changeCorrectionMode(false)">Finish corrections</Button>
       </section>
       <p v-if="correctionError" class="form-error" role="alert">{{ correctionError }}</p>
-      <section v-if="careerQuery.data.value?.requiresStartingStatus && !careerQuery.data.value?.startingStatus" class="winner-banner">
-        <strong>Record your career start before entering results.</strong>
-        <button type="button" class="link-button" @click="activeTab = 'Career'">Go to career</button>
+      <section v-if="careerStartNeedsSetup" class="winner-banner career-setup-banner">
+        <div><strong>Set up your career start before recording results and milestone evidence.</strong><p>Choose unemployed or select a starting club below the first division. You can add that club before completing setup. Existing records remain readable.</p></div>
+        <Button v-if="canManageCareer" class="outline-button" @click="activeTab = 'Career'">Open career setup</Button>
+        <Button v-if="canManageCareer && !allClubs.some(club => club.initialDivisionLevel > 1)" class="primary-button" @click="openClub()">Add starting club</Button>
       </section>
+      <section v-else-if="challenge.status === 'PendingPlayers'" class="winner-banner">Waiting for your rival. Career setup and existing records are available; results and milestone evidence can be entered when both managers have joined.</section>
 
       <nav class="challenge-tabs" aria-label="Challenge sections">
-        <button v-for="tab in ['Overview', 'Career', 'Seasons', 'Transfers', 'Achievements', 'Activity', 'Rules']" :key="tab" :class="{ selected: activeTab === tab }" :aria-pressed="activeTab === tab" @click="activeTab = tab">
+        <button v-for="tab in primaryTabs" :key="tab" :class="{ selected: activeTab === tab }" :aria-pressed="activeTab === tab" @click="activeTab = tab">
           {{ tab }}
           <span v-if="tab === 'Achievements' && achievementQuery.isSuccess.value" class="tab-count">{{ achievements.length }}</span>
         </button>
+        <details class="challenge-more-nav" :open="moreTabs.includes(activeTab)">
+          <summary :class="{ selected: moreTabs.includes(activeTab) }">{{ moreTabs.includes(activeTab) ? `More · ${activeTab}` : 'More · Transfers, activity & rules' }}</summary>
+          <div class="challenge-more-items">
+            <button v-for="tab in moreTabs" :key="tab" :class="{ selected: activeTab === tab }" :aria-pressed="activeTab === tab" @click="activeTab = tab">{{ tab }}</button>
+          </div>
+        </details>
         <span class="tabs-live"><span class="online-dot"></span> {{ connectionStatus ? 'SYNCED' : 'SYNCING' }}</span>
       </nav>
-      <p v-if="seasonsQuery.isError.value && activeTab !== 'Seasons' && activeTab !== 'Overview'" class="detail-error" role="alert">Seasons could not be loaded. Actions that need the current season are unavailable. <button class="link-button" @click="() => seasonsQuery.refetch()">Try again</button></p>
-      <p v-else-if="seasonsQuery.isPending.value && activeTab !== 'Seasons' && activeTab !== 'Overview'" class="challenge-placeholder" role="status">Loading seasons before enabling season-dependent actions…</p>
+      <p v-if="canRecordGameplay && seasonsQuery.isError.value && activeTab !== 'Seasons' && activeTab !== 'Overview'" class="detail-error" role="alert">Seasons could not be loaded. Actions that need the current season are unavailable. <button class="link-button" @click="() => seasonsQuery.refetch()">Try again</button></p>
+      <p v-else-if="canRecordGameplay && seasonsQuery.isPending.value && activeTab !== 'Seasons' && activeTab !== 'Overview'" class="challenge-placeholder" role="status">Loading seasons before enabling season-dependent actions…</p>
 
       <section v-if="activeTab === 'Overview'" class="challenge-content overview-grid">
         <div class="overview-main">
-          <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> NEXT MILESTONE</span><h2>Your season, your story.</h2></div><Button v-if="!isReadOnly" class="primary-button" :disabled="!seasonsQuery.isSuccess.value" @click="openSeasonDialog()"><Plus :size="15" /> Update season</Button></div>
+          <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> NEXT MILESTONE</span><h2>Your season, your story.</h2></div><Button v-if="canRecordGameplay" class="primary-button" :disabled="!seasonsQuery.isSuccess.value" @click="openSeasonDialog()"><Plus :size="15" /> Update season</Button></div>
           <div v-if="seasonsQuery.isPending.value || careerQuery.isPending.value" class="challenge-placeholder" role="status">Loading your season and career…</div>
           <div v-else-if="seasonsQuery.isError.value || careerQuery.isError.value" class="detail-error" role="alert">Your season and career could not be loaded. <button class="link-button" @click="() => { seasonsQuery.refetch(); careerQuery.refetch() }">Try again</button></div>
           <div v-else class="season-feature">
@@ -1767,7 +1935,7 @@ function clubSeasonLabel(stintId: string) {
               <div><strong>{{ allClubs.length }}</strong><span>CLUBS MANAGED</span></div>
             </div>
           </div>
-          <div class="detail-section-head compact"><div><span class="eyebrow"><span class="eyebrow-line"></span> CAREER PATH</span><h2>Club journey</h2></div><Button v-if="!isReadOnly" class="text-action" @click="openClub()"><CirclePlus :size="15" /> Add club</Button></div>
+          <div class="detail-section-head compact"><div><span class="eyebrow"><span class="eyebrow-line"></span> CAREER PATH</span><h2>Club journey</h2></div><Button v-if="canManageCareer" class="text-action" @click="openClub()"><CirclePlus :size="15" /> Add club</Button></div>
           <div class="score-timeline-card">
             <div class="chart-heading"><div><span class="eyebrow"><span class="eyebrow-line"></span> SEASON BY SEASON</span><h3>Confirmed points timeline</h3></div><span class="chart-legend-dot"></span></div>
             <div v-if="scoreQuery.isPending.value" class="chart-empty">Loading score history...</div>
@@ -1776,7 +1944,7 @@ function clubSeasonLabel(stintId: string) {
               v-else
               :participants="scoreQuery.data.value?.participants ?? []"
               :series="scoreQuery.data.value?.series ?? []"
-              :start-year="challenge.startSeasonYear"
+              :start-year="challengeStartYear"
             />
           </div>
           <div v-if="scoreQuery.data.value" class="rulebook-grid">
@@ -1805,47 +1973,76 @@ function clubSeasonLabel(stintId: string) {
 
         <aside class="overview-side">
           <article class="detail-side-card checkpoint-card"><span class="eyebrow"><span class="eyebrow-line"></span> ROAD TO GLORY</span><h3>Progress to {{ challenge.targetPoints }}</h3><div class="checkpoint-ring"><div><strong>{{ Math.min(100, Math.round(((me?.score ?? 0) / challenge.targetPoints) * 100)) }}<small>%</small></strong><span>COMPLETE</span></div></div><div class="checkpoint-meta"><span>{{ me?.score ?? 0 }} points</span><span>{{ challenge.targetPoints }} target</span></div><ProgressBar :value="Math.min(100, ((me?.score ?? 0) / challenge.targetPoints) * 100)" aria-label="Progress to the challenge target" :show-value="false" /><div class="three-clubs"><Shield :size="15" /><span>A win also requires 3 clubs with at least 20 official games each.</span></div></article>
-          <article class="detail-side-card next-goal-card"><div class="side-card-heading"><div class="side-icon gold"><Trophy :size="16" /></div><div><span class="eyebrow">QUICK ADD</span><h3>Log a milestone</h3></div></div><p>Turn this season's achievements into points. Pick from your challenge's rulebook.</p><Button class="outline-button full-button" @click="activeTab = 'Achievements'">Explore achievements <ChevronRight :size="14" /></Button></article>
+          <article v-if="canViewGameplay" class="detail-side-card next-goal-card"><div class="side-card-heading"><div class="side-icon gold"><Trophy :size="16" /></div><div><span class="eyebrow">QUICK ADD</span><h3>Log a milestone</h3></div></div><p>Turn this season's achievements into points. Pick from your challenge's rulebook.</p><Button class="outline-button full-button" @click="activeTab = 'Achievements'">Explore achievements <ChevronRight :size="14" /></Button></article>
           <article class="detail-side-card season-card-small"><div class="side-card-heading"><div class="side-icon"><Radio :size="16" /></div><div><span class="eyebrow">LIVE COMPARISON</span><h3>Season timeline</h3></div></div><p>First bonuses and duels compare the in-game season—not real-world activity.</p><div class="timeline-seasons"><span v-for="season in allSeasons.slice(-4)" :key="season.id" :class="{ complete: season.status === 'Completed' }">{{ season.displayName }}</span></div></article>
         </aside>
       </section>
 
       <section v-else-if="activeTab === 'Career'" class="challenge-content tab-content">
-        <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> MANAGER PROFILE</span><h2>Your career timeline</h2><p class="section-copy">Clubs count toward the win condition once you've managed at least 20 official games.</p></div><Button v-if="!isReadOnly" class="primary-button" @click="openClub()"><Plus :size="15" /> Add a club</Button></div>
+        <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> MANAGER PROFILE</span><h2>Your career timeline</h2><p class="section-copy">Clubs count toward the win condition once you've managed at least 20 official games.</p></div><Button v-if="canManageCareer" class="primary-button" @click="openClub()"><Plus :size="15" /> Add a club</Button></div>
         <div v-if="careerQuery.isSuccess.value" class="rulebook-note"><div>
           <strong>Career start</strong>
           <p v-if="careerQuery.data.value?.startingStatus === 'Unemployed'">Started unemployed.</p>
           <p v-else-if="careerQuery.data.value?.startingStatus === 'Club'">Starting club: {{ allClubs.find(club => club.id === careerQuery.data.value?.startingStintId)?.clubName }}.</p>
-          <p v-else>Not recorded. Start unemployed or at a club below the first division.</p>
-          <Button v-if="!isReadOnly" class="outline-button" label="Set career start" @click="openCareerStart" />
+          <p v-else>{{ careerQuery.data.value?.requiresStartingStatus ? 'Required before entering results. Start unemployed or at a club below the first division.' : 'Not required for this existing career.' }}</p>
+          <Button v-if="canManageCareer" class="outline-button" label="Set career start" @click="openCareerStart" />
+          <Button v-if="canManageCareer && careerQuery.data.value?.requiresStartingStatus && careerStartStatus === 'Club' && !allClubs.some(club => club.initialDivisionLevel > 1)" class="outline-button" label="Add starting club" @click="openClub()" />
         </div></div>
+        <div v-if="careerQuery.isSuccess.value && !careerStartNeedsSetup && (nationalTeamsQuery.data.value?.length || allClubs.some(club => club.officialMatches > 0))" class="rulebook-note calculated-milestones">
+          <div><strong>Calculated milestone status</strong>
+            <p>20 national team matches: {{ careerQuery.data.value?.nationalTeamCalculatedSeasonIndex != null ? seasonName(careerQuery.data.value.nationalTeamCalculatedSeasonIndex) : 'not yet calculated from complete season allocations' }}.</p>
+            <p>Three continents: {{ careerQuery.data.value?.threeContinentsCalculatedSeasonIndex != null ? seasonName(careerQuery.data.value.threeContinentsCalculatedSeasonIndex) : 'not yet calculated from complete season allocations and known countries' }}.</p>
+          </div>
+        </div>
         <p v-if="clubActionError" class="form-error" role="alert">{{ clubActionError }}</p>
         <div v-if="careerQuery.isPending.value" class="challenge-placeholder" role="status">Loading clubs…</div>
         <div v-else-if="careerQuery.isError.value" class="detail-error" role="alert">Could not load your career. <button class="link-button" @click="() => careerQuery.refetch()">Try again</button></div>
         <div v-else-if="allClubs.length" class="career-timeline">
           <article v-for="(club, index) in allClubs" :key="club.id" class="timeline-club">
             <div class="timeline-marker"><span>{{ String(index + 1).padStart(2, '0') }}</span></div>
-            <div class="timeline-club-card"><div class="timeline-club-title"><div><strong>{{ careerClubLabel(club) }}</strong><span>{{ club.countryName }} · Division level {{ club.initialDivisionLevel }}</span></div><Tag :value="club.clubEligibleSeasonIndex != null ? 'MILESTONE ELIGIBLE' : club.eligibleSeasonIndex != null ? 'MILESTONE NEEDS REVIEW' : club.clubOfficialMatches >= 20 ? 'MILESTONE SEASON NEEDED' : `${club.clubOfficialMatches}/20 CLUB GAMES`" :severity="club.clubEligibleSeasonIndex != null ? 'success' : 'secondary'" /></div><div class="timeline-club-bottom"><span><CalendarDays :size="13" /> {{ seasonName(club.startSeasonIndex) }}{{ club.endSeasonIndex != null ? ` to ${seasonName(club.endSeasonIndex)}` : ' to present' }}</span><span><Flag :size="13" /> {{ club.officialMatches }} matches in this stint · {{ club.clubOfficialMatches }} across club stints · {{ club.countryOfficialMatches }} in {{ club.countryName }}</span><span v-if="club.eligibleSeasonIndex != null && club.clubMilestoneValid === false">This stint's club milestone needs review</span><span v-if="club.countryEligibleSeason != null">Country milestone: {{ seasonName(club.countryEligibleSeason) }}</span><span v-if="club.countryEligibleSeasonIndex != null && club.countryMilestoneValid === false">This stint's country milestone needs review</span><button v-if="!isReadOnly" class="link-button" :aria-label="`Update matches for ${careerClubLabel(club)}`" @click="openClubMatches(club)">Update matches</button><button v-if="!isReadOnly" class="link-button" :disabled="saving" :aria-label="`Set country milestone for ${careerClubLabel(club)}`" @click="openCountryMilestone(club)">Country milestone</button><button v-if="!isReadOnly" class="link-button" :disabled="saving" :aria-label="`Edit ${careerClubLabel(club)}`" @click="openClub(club)">Edit</button><button v-if="!isReadOnly" class="link-button" :disabled="saving" :aria-label="`Remove ${careerClubLabel(club)}`" @click="deleteClub(club)">Remove</button></div></div>
+            <div class="timeline-club-card">
+              <div class="timeline-club-title"><div><strong>{{ careerClubLabel(club) }}</strong><span>{{ club.countryName }} · Division level {{ club.initialDivisionLevel }}</span></div><Tag :value="club.clubEligibleSeasonIndex != null ? 'MILESTONE ELIGIBLE' : club.eligibleSeasonIndex != null ? 'MILESTONE NEEDS REVIEW' : club.clubOfficialMatches >= 20 ? 'MILESTONE SEASON NEEDED' : `${club.clubOfficialMatches}/20 CLUB GAMES`" :severity="club.clubEligibleSeasonIndex != null ? 'success' : 'secondary'" /></div>
+              <div class="timeline-club-bottom">
+                <span><CalendarDays :size="13" /> {{ seasonName(club.startSeasonIndex) }}{{ club.endSeasonIndex != null ? ` to ${seasonName(club.endSeasonIndex)}` : ' to present' }}</span>
+                <span>{{ club.officialMatches }} matches in this stint</span>
+                <span v-if="club.eligibleSeasonIndex != null && club.clubMilestoneValid === false" role="status">This stint's club milestone needs review</span>
+                <span v-if="club.countryEligibleSeasonIndex != null && club.countryMilestoneValid === false" role="status">This stint's country milestone needs review</span>
+                <button v-if="canManageCareer" class="link-button" :disabled="saving" :aria-label="`Edit ${careerClubLabel(club)}`" @click="openClub(club)">Edit</button>
+              </div>
+              <details class="career-record-details">
+                <summary>Match totals and actions</summary>
+                <div class="timeline-club-bottom">
+                  <span>{{ club.clubOfficialMatches }} across club stints · {{ club.countryOfficialMatches }} in {{ club.countryName }}</span>
+                  <span v-if="club.countryEligibleSeason != null">Country milestone: {{ seasonName(club.countryEligibleSeason) }}</span>
+                  <button v-if="canManageCareer" class="link-button" :disabled="saving" :aria-label="`Update matches for ${careerClubLabel(club)}`" @click="openClubMatches(club)">Update matches</button>
+                  <button v-if="canRecordGameplay" class="link-button" :disabled="saving" :aria-label="`Set country milestone for ${careerClubLabel(club)}`" @click="openCountryMilestone(club)">Country milestone</button>
+                  <button v-if="canManageCareer" class="link-button" :disabled="saving" :aria-label="`Remove ${careerClubLabel(club)}`" @click="deleteClub(club)">Remove</button>
+                </div>
+              </details>
+            </div>
           </article>
         </div>
-        <div v-else class="empty-detail large"><Users :size="23" /><strong>Your journey is waiting.</strong><span>Add the clubs you've managed, including your starting club, to see your full career path.</span><Button v-if="!isReadOnly" class="primary-button" @click="openClub()"><Plus :size="15" /> Add first club</Button></div>
-        <div v-if="careerQuery.isSuccess.value" class="rulebook-note"><div><strong>Three continents</strong><p>Complete season match allocations and catalog country codes calculate the milestone. Otherwise, record the season when you first managed a match in your third continent.</p><p v-if="careerQuery.data.value?.threeContinentsCalculatedSeasonIndex != null">Calculated milestone season: {{ seasonName(careerQuery.data.value.threeContinentsCalculatedSeasonIndex) }}.</p><p v-if="careerQuery.data.value?.threeContinentsSeasonIndex != null">Attested milestone season: {{ seasonName(careerQuery.data.value.threeContinentsSeasonIndex) }}. <span v-if="!careerQuery.data.value.threeContinentsMilestoneValid">Milestone needs review: the career records no longer support it.</span><span v-else>The career records support this milestone.</span></p><Button v-if="!isReadOnly" type="button" class="outline-button" label="Set continent milestone" @click="openContinentsMilestone" /></div></div>
-        <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> NATIONAL TEAMS</span><h2>International career</h2><p class="section-copy">National team matches are recorded separately from club matches and can overlap a club stint.</p></div><Button v-if="!isReadOnly" class="primary-button" :disabled="!seasonsQuery.isSuccess.value" @click="openNationalTeam()"><Plus :size="15" /> Add national team</Button></div>
+        <div v-else class="empty-detail large"><Users :size="23" /><strong>Your journey is waiting.</strong><span>Add the clubs you've managed, including your starting club, to see your full career path.</span><Button v-if="canManageCareer" class="primary-button" @click="openClub()"><Plus :size="15" /> Add first club</Button></div>
+        <details class="career-optional">
+          <summary>International career and optional milestone evidence <span v-if="careerQuery.data.value && (careerQuery.data.value.threeContinentsSeasonIndex != null && !careerQuery.data.value.threeContinentsMilestoneValid || careerQuery.data.value.nationalTeam20MatchSeasonIndex != null && !careerQuery.data.value.nationalTeamMilestoneValid)" class="review-needed">Review needed</span></summary>
+        <div v-if="careerQuery.isSuccess.value" class="rulebook-note"><div><strong>Three continents · manual evidence</strong><p>Complete season match allocations and catalog country codes calculate the milestone. Otherwise, attest the season when you first managed a match in your third continent.</p><p v-if="careerQuery.data.value?.threeContinentsSeasonIndex != null">Attested milestone season: {{ seasonName(careerQuery.data.value.threeContinentsSeasonIndex) }}. <span v-if="!careerQuery.data.value.threeContinentsMilestoneValid">Milestone needs review: the career records no longer support it.</span><span v-else>The career records support this milestone.</span></p><Button v-if="canRecordGameplay" type="button" class="outline-button" label="Set continent milestone" @click="openContinentsMilestone" /></div></div>
+        <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> NATIONAL TEAMS</span><h2>International career</h2><p class="section-copy">National team matches are recorded separately from club matches and can overlap a club stint.</p></div><Button v-if="canRecordGameplay" class="primary-button" :disabled="!seasonsQuery.isSuccess.value" @click="openNationalTeam()"><Plus :size="15" /> Add national team</Button></div>
         <p v-if="nationalTeamError && !nationalTeamDialogVisible" class="form-error" role="alert">{{ nationalTeamError }}</p>
         <div v-if="nationalTeamsQuery.isPending.value" class="challenge-placeholder">Loading national teams…</div>
         <div v-else-if="nationalTeamsQuery.isError.value" class="detail-error" role="alert">Could not load national teams: {{ nationalTeamsQuery.error.value?.message }}</div>
-        <div v-else-if="nationalTeamsQuery.data.value?.length" class="season-table-wrap"><table class="season-table"><thead><tr><th>TEAM</th><th>START</th><th>END</th><th>OFFICIAL MATCHES</th><th v-if="!isReadOnly">ACTION</th></tr></thead><tbody><tr v-for="team in nationalTeamsQuery.data.value" :key="team.id"><td>{{ team.teamName }}</td><td>{{ seasonName(team.startSeasonIndex) }}</td><td>{{ team.endSeasonIndex === null ? 'Present' : seasonName(team.endSeasonIndex) }}</td><td>{{ team.officialMatches }}</td><td v-if="!isReadOnly"><button class="link-button" :disabled="saving" :aria-label="`Edit ${team.teamName} stint`" @click="openNationalTeam(team)">Edit</button> <button class="link-button" :disabled="saving" :aria-label="`Remove ${team.teamName} stint`" @click="deleteNationalTeam(team)">Remove</button></td></tr></tbody></table></div>
+        <div v-else-if="nationalTeamsQuery.data.value?.length" class="season-table-wrap"><table class="season-table"><thead><tr><th>TEAM</th><th>START</th><th>END</th><th>OFFICIAL MATCHES</th><th v-if="canRecordGameplay">ACTION</th></tr></thead><tbody><tr v-for="team in nationalTeamsQuery.data.value" :key="team.id"><td>{{ team.teamName }}</td><td>{{ seasonName(team.startSeasonIndex) }}</td><td>{{ team.endSeasonIndex === null ? 'Present' : seasonName(team.endSeasonIndex) }}</td><td>{{ team.officialMatches }}</td><td v-if="canRecordGameplay"><button class="link-button" :disabled="saving" :aria-label="`Edit ${team.teamName} stint`" @click="openNationalTeam(team)">Edit</button> <button class="link-button" :disabled="saving" :aria-label="`Remove ${team.teamName} stint`" @click="deleteNationalTeam(team)">Remove</button></td></tr></tbody></table></div>
         <div v-else class="empty-detail"><span>No national team stints recorded.</span></div>
-        <div v-if="careerQuery.isSuccess.value" class="rulebook-note"><div><strong>20 national team matches</strong><p>Complete season allocations across all national team stints calculate the milestone automatically. Otherwise, record the season when you completed your 20th official match. Club matches do not count.</p><p v-if="careerQuery.data.value?.nationalTeamCalculatedSeasonIndex != null">Calculated milestone season: {{ seasonName(careerQuery.data.value.nationalTeamCalculatedSeasonIndex) }}.</p><p v-if="careerQuery.data.value?.nationalTeam20MatchSeasonIndex != null">Attested milestone season: {{ seasonName(careerQuery.data.value.nationalTeam20MatchSeasonIndex) }}. <span v-if="!careerQuery.data.value.nationalTeamMilestoneValid">Milestone needs review: the national team records no longer support it.</span><span v-else>The national team records support this milestone.</span></p><Button v-if="!isReadOnly" type="button" class="outline-button" label="Set milestone season" @click="openNationalMilestone" /></div></div>
+        <div v-if="careerQuery.isSuccess.value" class="rulebook-note"><div><strong>20 national team matches · manual evidence</strong><p>Complete season allocations calculate the milestone automatically. Otherwise, attest the season when you completed your 20th official match. Club matches do not count.</p><p v-if="careerQuery.data.value?.nationalTeam20MatchSeasonIndex != null">Attested milestone season: {{ seasonName(careerQuery.data.value.nationalTeam20MatchSeasonIndex) }}. <span v-if="!careerQuery.data.value.nationalTeamMilestoneValid">Milestone needs review: the national team records no longer support it.</span><span v-else>The national team records support this milestone.</span></p><Button v-if="canRecordGameplay" type="button" class="outline-button" label="Set milestone season" @click="openNationalMilestone" /></div></div>
+        </details>
       </section>
 
       <section v-else-if="activeTab === 'Seasons'" class="challenge-content tab-content">
-        <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> SEASON RECORDS</span><h2>Every season, on the record.</h2><p class="section-copy">League figures determine the annual PPG and goals-per-game duels. Complete seasons to confirm head-to-head results.</p></div><Button v-if="!isReadOnly" class="primary-button" :disabled="!seasonsQuery.isSuccess.value" @click="openSeasonDialog()"><Plus :size="15" /> Update season</Button></div>
+        <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> SEASON RECORDS</span><h2>Every season, on the record.</h2><p class="section-copy">League figures determine annual duels. Complete comparable seasons to confirm head-to-head results.</p></div><div class="season-actions"><Button v-if="canViewGameplay" class="text-action" @click="activeTab = 'Transfers'">View transfers <ChevronRight :size="14" /></Button><Button v-if="canRecordGameplay" class="primary-button" :disabled="!seasonsQuery.isSuccess.value" @click="openSeasonDialog()"><Plus :size="15" /> Update season</Button></div></div>
         <p v-if="scoreQuery.data.value?.currencyMismatchSeasons?.length" class="form-error" role="status">Transfer duels are pending for {{ scoreQuery.data.value.currencyMismatchSeasons.map(seasonName).join(', ') }}: both managers must record their sales in the same currency.</p>
         <div v-if="seasonsQuery.isPending.value" class="challenge-placeholder" role="status">Loading seasons…</div>
         <div v-else-if="seasonsQuery.isError.value" class="detail-error" role="alert">Could not load seasons. <button class="link-button" @click="() => seasonsQuery.refetch()">Try again</button></div>
-        <div v-else-if="allSeasons.length" class="season-table-wrap"><table class="season-table"><thead><tr><th>SEASON</th><th>STATUS</th><th>GAMES</th><th>W-D-L</th><th>POINTS</th><th>GOALS</th><th>BEST SALE</th><th v-if="!isReadOnly">ACTION</th></tr></thead><tbody><tr v-for="season in allSeasons" :key="season.id"><td><strong>{{ season.displayName }}</strong></td><td><Tag :value="season.status" :severity="season.status === 'Completed' ? 'success' : 'secondary'" /></td><td>{{ season.leagueMatches }}</td><td>{{ season.leagueWins }}-{{ season.leagueDraws }}-{{ season.leagueLosses }}</td><td>{{ season.leaguePoints }}</td><td>{{ season.goalsFor }}-{{ season.goalsAgainst }}</td><td>{{ transfersQuery.isPending.value ? 'Loading…' : transfersQuery.isError.value ? 'Unavailable' : new Intl.NumberFormat('en', { style: 'currency', currency: season.currency }).format(largestSeasonSale(season)) }}</td><td v-if="!isReadOnly"><button class="link-button" :aria-label="`Edit ${season.displayName}`" @click="openSeasonDialog(season)">Edit</button></td></tr></tbody></table></div>
-        <div v-else class="empty-detail large"><CalendarDays :size="23" /><strong>No seasons recorded yet.</strong><span>Record your first season to begin earning duels and building your FM timeline.</span><Button v-if="!isReadOnly" class="primary-button" @click="openSeasonDialog()"><Plus :size="15" /> Record a season</Button></div>
+        <div v-else-if="allSeasons.length" class="season-table-wrap"><table class="season-table"><thead><tr><th>SEASON</th><th>STATUS</th><th>GAMES</th><th>W-D-L</th><th>POINTS</th><th>GOALS</th><th>BEST SALE</th><th v-if="canRecordGameplay">ACTION</th></tr></thead><tbody><tr v-for="season in allSeasons" :key="season.id"><td><strong>{{ season.displayName }}</strong></td><td><Tag :value="season.status" :severity="season.status === 'Completed' ? 'success' : 'secondary'" /></td><td>{{ season.leagueMatches }}</td><td>{{ season.leagueWins }}-{{ season.leagueDraws }}-{{ season.leagueLosses }}</td><td>{{ season.leaguePoints }}</td><td>{{ season.goalsFor }}-{{ season.goalsAgainst }}</td><td>{{ transfersQuery.isPending.value ? 'Loading…' : transfersQuery.isError.value ? 'Unavailable' : new Intl.NumberFormat('en', { style: 'currency', currency: season.currency }).format(largestSeasonSale(season)) }}</td><td v-if="canRecordGameplay"><button class="link-button" :aria-label="`Edit ${season.displayName}`" @click="openSeasonDialog(season)">Edit</button></td></tr></tbody></table></div>
+        <div v-else class="empty-detail large"><CalendarDays :size="23" /><strong>No seasons recorded yet.</strong><span>Record your first season to begin earning duels and building your FM timeline.</span><Button v-if="canRecordGameplay" class="primary-button" @click="openSeasonDialog()"><Plus :size="15" /> Record a season</Button></div>
         <div v-for="season in allSeasons.filter(item => item.clubSeasons?.length)" :key="`${season.id}-clubs`" class="rulebook-note">
           <div><strong>{{ season.displayName }} · club statistics</strong><p>{{ season.usesClubBreakdown ? 'These club totals determine the season league duels.' : 'Saved club statistics; the quick summary currently determines the season league duels.' }}</p>
             <div class="season-table-wrap"><table class="season-table"><thead><tr><th>CLUB</th><th>DIVISION</th><th>OFFICIAL</th><th>LEAGUE</th><th>W-D-L</th><th>POINTS</th><th>GOALS</th><th>POSITION</th></tr></thead><tbody><tr v-for="row in season.clubSeasons" :key="row.careerStintId"><td>{{ clubSeasonLabel(row.careerStintId) }}</td><td>{{ row.divisionLevel }}</td><td>{{ row.officialMatches }}</td><td>{{ row.leagueMatches }}</td><td>{{ row.leagueWins }}-{{ row.leagueDraws }}-{{ row.leagueLosses }}</td><td>{{ row.leaguePoints }}</td><td>{{ row.goalsFor }}-{{ row.goalsAgainst }}</td><td>{{ row.leaguePosition ?? '—' }}</td></tr></tbody></table></div>
@@ -1854,13 +2051,13 @@ function clubSeasonLabel(stintId: string) {
       </section>
 
       <section v-else-if="activeTab === 'Transfers'" class="challenge-content tab-content">
-        <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> TRANSFERS</span><h2>Deals on the record.</h2><p class="section-copy">Record fixed fees only. A season's largest sale is the higher of its quick summary and individual sales; the same deal is never added twice.</p></div><Button v-if="!isReadOnly" class="primary-button" :disabled="!seasonsQuery.isSuccess.value" @click="openTransfer()"><Plus :size="15" /> Record transfer</Button></div>
+        <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> TRANSFERS</span><h2>Deals on the record.</h2><p class="section-copy">Record fixed fees only. A season's largest sale is the higher of its quick summary and individual sales; the same deal is never added twice.</p></div><Button v-if="canRecordGameplay" class="primary-button" :disabled="!seasonsQuery.isSuccess.value" @click="openTransfer()"><Plus :size="15" /> Record transfer</Button></div>
         <p v-if="transferError && !transferDialogVisible" class="form-error" role="alert">{{ transferError }}</p>
         <div v-if="transfersQuery.isPending.value" class="challenge-placeholder">Loading transfers…</div>
         <div v-else-if="transfersQuery.isError.value" class="detail-error" role="alert">Could not load transfers: {{ transfersQuery.error.value?.message }}</div>
         <template v-else-if="allTransfers.length">
           <div class="rulebook-grid"><article v-for="summary in transferSummaries" :key="summary.currency"><strong>{{ summary.currency }} · {{ summary.count }} operations</strong><p>Spent {{ summary.spent.toLocaleString('en') }} · Received {{ summary.received.toLocaleString('en') }} · Balance {{ (summary.received - summary.spent).toLocaleString('en') }} · Largest purchase {{ summary.largestPurchase.toLocaleString('en') }} · Largest sale {{ summary.largestSale.toLocaleString('en') }}</p></article></div>
-          <div class="season-table-wrap"><table class="season-table"><thead><tr><th>SEASON</th><th>PLAYER</th><th>TYPE</th><th>MANAGED CLUB</th><th>OTHER CLUB</th><th>FIXED FEE</th><th v-if="!isReadOnly">ACTION</th></tr></thead><tbody><tr v-for="transfer in allTransfers" :key="transfer.id"><td>{{ seasonName(transfer.seasonIndex) }}</td><td>{{ transfer.playerName }}</td><td>{{ transfer.direction === 'Incoming' ? 'Purchase' : 'Sale' }}</td><td>{{ transfer.clubName }}</td><td>{{ transfer.counterpartyName }}</td><td>{{ new Intl.NumberFormat('en', { style: 'currency', currency: transfer.currency }).format(transfer.fixedAmount) }}</td><td v-if="!isReadOnly"><button class="link-button" :disabled="saving" :aria-label="`Edit transfer for ${transfer.playerName}`" @click="openTransfer(transfer)">Edit</button> <button class="link-button" :disabled="saving" :aria-label="`Remove transfer for ${transfer.playerName}`" @click="deleteTransfer(transfer)">Remove</button></td></tr></tbody></table></div>
+          <div class="season-table-wrap"><table class="season-table"><thead><tr><th>SEASON</th><th>PLAYER</th><th>TYPE</th><th>MANAGED CLUB</th><th>OTHER CLUB</th><th>FIXED FEE</th><th v-if="canRecordGameplay">ACTION</th></tr></thead><tbody><tr v-for="transfer in allTransfers" :key="transfer.id"><td>{{ seasonName(transfer.seasonIndex) }}</td><td>{{ transfer.playerName }}</td><td>{{ transfer.direction === 'Incoming' ? 'Purchase' : 'Sale' }}</td><td>{{ transfer.clubName }}</td><td>{{ transfer.counterpartyName }}</td><td>{{ new Intl.NumberFormat('en', { style: 'currency', currency: transfer.currency }).format(transfer.fixedAmount) }}</td><td v-if="canRecordGameplay"><button class="link-button" :disabled="saving" :aria-label="`Edit transfer for ${transfer.playerName}`" @click="openTransfer(transfer)">Edit</button> <button class="link-button" :disabled="saving" :aria-label="`Remove transfer for ${transfer.playerName}`" @click="deleteTransfer(transfer)">Remove</button></td></tr></tbody></table></div>
         </template>
         <div v-else class="empty-detail large"><strong>No individual transfers recorded.</strong><span>You can also enter your largest sale directly in the season form.</span></div>
       </section>
@@ -1869,10 +2066,10 @@ function clubSeasonLabel(stintId: string) {
         <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> THE RULEBOOK</span><h2>Milestones & achievements</h2><p class="section-copy">The backend calculates points, but not every condition is checked automatically. Please verify the requirements before recording an achievement.</p></div><div v-if="achievementQuery.isSuccess.value" class="achievement-total"><strong>{{ achievements.length }}</strong><span>GOALS IN THIS RULEBOOK</span></div></div>
         <div class="category-filter" aria-label="Achievement category filters"><button v-for="category in ['All', ...categories]" :key="category" :class="{ selected: selectedCategory === category }" :aria-pressed="selectedCategory === category" @click="selectedCategory = category">{{ category }}</button></div>
         <div v-if="achievementQuery.isSuccess.value" class="achievement-filters">
-          <label>Search achievements <input v-model="achievementSearch" type="search" placeholder="Name, code or description" /></label>
-          <label>Frequency <select v-model="achievementFrequency"><option value="All">All frequencies</option><option v-for="frequency in frequencies" :key="frequency" :value="frequency">{{ frequency.replace(/([A-Z])/g, ' $1').trim() }}</option></select></label>
-          <label>Status <select v-model="achievementStatus"><option value="All">All statuses</option><option>Enabled</option><option>Disabled</option><option>Recorded</option><option>Not recorded</option></select></label>
-          <label>Points <select v-model="achievementPoints"><option value="All">All points</option><option v-for="points in pointValues" :key="points" :value="String(points)">{{ points }}</option></select></label>
+          <label>Search achievements <input v-model="achievementSearch" type="search" placeholder="Name, code or description" /><FieldHelp>Filter by objective name, code or description.</FieldHelp></label>
+          <label>Frequency <select v-model="achievementFrequency"><option value="All">All frequencies</option><option v-for="frequency in frequencies" :key="frequency" :value="frequency">{{ frequency.replace(/([A-Z])/g, ' $1').trim() }}</option></select><FieldHelp>Show objectives by their repeat-claim limit.</FieldHelp></label>
+          <label>Status <select v-model="achievementStatus"><option value="All">All statuses</option><option>Enabled</option><option>Disabled</option><option>Recorded</option><option>Not recorded</option></select><FieldHelp>Filter configuration or your recorded claims; no records are changed.</FieldHelp></label>
+          <label>Points <select v-model="achievementPoints"><option value="All">All points</option><option v-for="points in pointValues" :key="points" :value="String(points)">{{ points }}</option></select><FieldHelp>Filter by the displayed base-point value.</FieldHelp></label>
           <button type="button" class="outline-button" @click="clearAchievementFilters">Clear filters</button>
         </div>
         <p v-if="claimActionError" class="form-error" role="alert">{{ claimActionError }}</p>
@@ -1890,10 +2087,10 @@ function clubSeasonLabel(stintId: string) {
             <div v-for="claim in achievement.claims" :key="claim.id" class="claim-history">
               <span>{{ seasonName(claim.seasonIndex) }}{{ claim.clubName ? ` · ${claim.clubName}` : '' }}</span>
               <span v-if="achievement.code === 'G053'">Older manual record; set the career milestone to update it.</span>
-              <button v-if="!isReadOnly && achievement.code !== 'G053'" class="link-button" :disabled="saving" :aria-label="`Edit ${achievement.name} for ${seasonName(claim.seasonIndex)}`" @click="openAchievement(achievement, claim)">Edit</button>
-              <button v-if="!isReadOnly" class="link-button" :disabled="saving" :aria-label="`Remove ${achievement.name} for ${seasonName(claim.seasonIndex)}`" @click="deleteAchievement(achievement, claim)">Remove</button>
+              <button v-if="canRecordGameplay && achievement.code !== 'G053'" class="link-button" :disabled="saving" :aria-label="`Edit ${achievement.name} for ${seasonName(claim.seasonIndex)}`" @click="openAchievement(achievement, claim)">Edit</button>
+              <button v-if="canRecordGameplay" class="link-button" :disabled="saving" :aria-label="`Remove ${achievement.name} for ${seasonName(claim.seasonIndex)}`" @click="deleteAchievement(achievement, claim)">Remove</button>
             </div>
-            <Button v-if="!isReadOnly && !achievement.isAutomatic" class="achievement-add" :disabled="!seasonsQuery.isSuccess.value" @click="openAchievement(achievement)"><Plus :size="14" /> Record</Button>
+            <Button v-if="canRecordGameplay && !achievement.isAutomatic" class="achievement-add" :disabled="!seasonsQuery.isSuccess.value" @click="openAchievement(achievement)"><Plus :size="14" /> Record</Button>
             <span v-else class="achievement-locked">{{ achievement.isAutomatic ? 'AUTOMATIC' : 'READ ONLY' }}</span>
           </article>
         </div>
@@ -1912,14 +2109,16 @@ function clubSeasonLabel(stintId: string) {
       <section v-else class="challenge-content tab-content">
         <div class="detail-section-head"><div><span class="eyebrow"><span class="eyebrow-line"></span> CHALLENGE SETTINGS</span><h2>Race to 500 rules</h2><p class="section-copy">Rules are scoped to this challenge and scoring is recalculated by the server.</p></div><Settings2 :size="20" class="settings-mark" /></div>
         <div class="rulebook-grid"><article><span>01</span><strong>{{ challenge.targetPoints }} confirmed points</strong><p>Base achievements, confirmed bonuses, seasonal duels, and confirmed checkpoints build your total.</p></article><article><span>02</span><strong>Three eligible clubs</strong><p>To win, log at least 20 official matches with each of three distinct clubs.</p></article><article><span>03</span><strong>In-game chronology</strong><p>First bonuses compare the challenge season index, not when a result was entered.</p></article><article><span>04</span><strong>One rival, separate saves</strong><p>Each manager records their own career. Opponents can never edit another player's record.</p></article></div>
-        <div v-if="me?.role === 'Administrator'" class="detail-form-grid">
+        <details v-if="me?.role === 'Administrator'" class="focused-task">
+          <summary>Invitations · create, review and revoke</summary>
+        <div class="detail-form-grid">
           <h3>Manage invitations</h3>
           <form v-if="!rival && !isReadOnly" class="detail-form-grid" @submit.prevent="createManagedInvite">
-            <label>Email (optional)<InputText v-model="inviteEmail" type="email" maxlength="256" /></label>
-            <label>Expires after days<InputNumber v-model="inviteExpiresInDays" required :min="1" :max="30" /></label>
+            <label>Email (optional)<InputText v-model="inviteEmail" type="email" maxlength="256" /><FieldHelp>Limit this invitation to an email address, or leave blank for a shareable link.</FieldHelp></label>
+            <label>Expires after days<InputNumber v-model="inviteExpiresInDays" required :min="1" :max="30" /><FieldHelp>Choose between 1 and 30 days.</FieldHelp></label>
             <Button type="submit" class="outline-button" :loading="saving" label="Create invitation" />
           </form>
-          <label v-if="createdInviteUrl">Invitation link (copy it now)<InputText :model-value="createdInviteUrl" readonly /></label>
+          <label v-if="createdInviteUrl">Invitation link (copy it now)<InputText :model-value="createdInviteUrl" readonly /><FieldHelp>The full private link is shown only after creation; copy it before leaving.</FieldHelp></label>
           <p v-if="inviteManagementError" class="form-error" role="alert">{{ inviteManagementError }}</p>
           <div v-if="challengeInvitesQuery.isPending.value" class="challenge-placeholder">Loading invitations…</div>
           <p v-else-if="challengeInvitesQuery.isError.value" class="form-error" role="alert">Could not load invitations: {{ challengeInvitesQuery.error.value?.message }}</p>
@@ -1928,12 +2127,18 @@ function clubSeasonLabel(stintId: string) {
           </div>
           <p v-else>No invitations have been created.</p>
         </div>
+        </details>
         <div v-if="rulesQuery.isPending.value" class="challenge-placeholder">Loading rule versions…</div>
         <p v-else-if="rulesQuery.isError.value" class="form-error" role="alert">Could not load challenge rules: {{ rulesQuery.error.value?.message }}</p>
         <template v-else-if="rulesQuery.data.value">
           <div class="rulebook-note"><Shield :size="16" /><p>Current version {{ rulesQuery.data.value.version }}. Enable an official achievement below to add it to this challenge. Rule changes are versioned and audited; preview their impact before applying them.</p></div>
+          <details class="focused-task">
+            <summary>Version and change history</summary>
           <div class="rulebook-note"><p><strong>Version history:</strong> <span v-for="(version, index) in rulesQuery.data.value.versions" :key="version.versionNumber">{{ index ? ' · ' : '' }}v{{ version.versionNumber }} from {{ seasonName(version.effectiveSeasonIndex) }}</span></p></div>
           <div v-if="rulesQuery.data.value.history.length" class="rulebook-note"><div><strong>Change history</strong><p v-for="(entry, index) in rulesQuery.data.value.history" :key="`${entry.createdAt}-${index}`">{{ new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(entry.createdAt)) }} · {{ participants.find(item => item.userId === entry.actorId)?.displayName ?? 'Administrator' }} · {{ entry.code ?? 'Rule' }} · {{ entry.policy === 'Retroactive' ? 'Retroactive' : 'From season' }}{{ entry.reason ? ` · ${entry.reason}` : '' }}</p></div></div>
+          </details>
+          <details class="focused-task">
+            <summary>Continental competitions · catalog and tiers</summary>
           <div class="rulebook-note"><div><strong>Continental competition catalog</strong><p>Map competitions to their continental tier. Linking a result distinguishes different competitions played in the same season; older unlinked claims remain conservative.</p>
             <p v-if="competitionsQuery.isPending.value">Loading competitions...</p>
             <p v-else-if="competitionsQuery.isError.value" class="form-error" role="alert">Could not load competitions. <button class="link-button" @click="() => competitionsQuery.refetch()">Try again</button></p>
@@ -1946,42 +2151,53 @@ function clubSeasonLabel(stintId: string) {
           </div></div>
           <form v-if="me?.role === 'Administrator' && !isRulesReadOnly && competitionsQuery.isSuccess.value" class="detail-form-grid" @submit.prevent="saveCompetition">
             <h3>{{ editingCompetition ? 'Edit competition' : 'Add a competition' }}</h3>
-            <label>Competition name<InputText v-model="competitionForm.name" required maxlength="120" /></label>
-            <label>Continental tier<select v-model="competitionForm.tier"><option value="Top">Top tier</option><option value="Second">Second tier</option><option value="Third">Third tier</option><option value="Other">Other continental competition</option></select></label>
+            <label>Competition name<InputText v-model="competitionForm.name" required maxlength="120" /><FieldHelp>The competition name used in your save; managers can link claims to it.</FieldHelp></label>
+            <label>Continental tier<select v-model="competitionForm.tier"><option value="Top">Top tier</option><option value="Second">Second tier</option><option value="Third">Third tier</option><option value="Other">Other continental competition</option></select><FieldHelp>Choose its rank among continental competitions, not the club's domestic division.</FieldHelp></label>
             <p v-if="competitionError" class="form-error" role="alert">{{ competitionError }}</p>
             <div class="dialog-actions"><Button v-if="editingCompetition" type="button" class="cancel-button" label="Cancel" @click="editCompetition()" /><Button type="submit" class="outline-button" :loading="saving" :label="editingCompetition ? 'Save competition' : 'Add competition'" /></div>
           </form>
+          </details>
+          <details v-if="me?.role === 'Administrator' && !isRulesReadOnly" class="focused-task">
+            <summary>Custom achievement · add a challenge objective</summary>
           <form v-if="me?.role === 'Administrator' && !isRulesReadOnly" class="detail-form-grid" @submit.prevent="createCustomAchievement">
             <h3>Add a custom achievement</h3>
-            <p class="form-intro">Custom achievements belong only to this challenge and can be recorded by both managers.</p>
-            <label>Name<InputText v-model="customAchievement.name" required maxlength="120" /></label>
-            <label>Description<InputText v-model="customAchievement.description" required maxlength="500" /></label>
-            <div class="form-row"><label>Frequency<select v-model="customAchievement.frequency"><option value="Once">Once</option><option value="Season">Once per season</option><option value="PerClub">Once per club</option><option value="PerCountry">Once per country</option><option value="ClubSeason">Once per club and season</option></select></label><label>Points<InputNumber v-model="customAchievement.points" required :min="0" :max="10000" /></label></div>
-            <label>First applicable season index<InputNumber v-model="customAchievement.effectiveSeasonIndex" required :min="0" :max="100" /></label>
+            <p class="form-intro">Custom achievements belong only to this challenge and can be recorded by both managers. These claims are self-reported.</p>
+            <label>Name<InputText v-model="customAchievement.name" required maxlength="120" /><FieldHelp>A short title both managers will see in Achievements.</FieldHelp></label>
+            <label>Description<InputText v-model="customAchievement.description" required maxlength="500" /><FieldHelp>Explain what managers must self-attest to record this custom objective.</FieldHelp></label>
+            <div class="form-row"><label>Frequency<select v-model="customAchievement.frequency"><option value="Once">Once</option><option value="Season">Once per season</option><option value="PerClub">Once per club</option><option value="PerCountry">Once per country</option><option value="ClubSeason">Once per club and season</option></select><FieldHelp>Controls when a manager can record this claim again.</FieldHelp></label><label>Points<InputNumber v-model="customAchievement.points" required :min="0" :max="10000" /><FieldHelp>Points are applied by the server using this challenge's rules.</FieldHelp></label></div>
+            <label>First applicable season<SeasonSelect v-model="customAchievement.effectiveSeasonIndex" :start-year="challengeStartYear" :max-index="seasonChoiceMaxIndex" required /><FieldHelp>Choose the first in-game season in which this custom rule applies.</FieldHelp></label>
             <p v-if="customAchievementError" class="form-error" role="alert">{{ customAchievementError }}</p>
             <Button type="submit" class="outline-button" :loading="saving" label="Add custom achievement" />
           </form>
+          </details>
+          <details v-if="me?.role === 'Administrator' && !isRulesReadOnly" class="focused-task">
+            <summary>Scoring rules · preview and apply a version</summary>
+            <p v-if="!seasonsQuery.isSuccess.value" class="form-intro">Load seasons before scheduling a rule change. <button type="button" class="link-button" @click="() => seasonsQuery.refetch()">Retry seasons</button></p>
           <form v-if="me?.role === 'Administrator' && !isRulesReadOnly && seasonsQuery.isSuccess.value" class="detail-form-grid" @submit.prevent="previewRuleChange">
-            <label>Scoring rule<select v-model="ruleCode" required @change="selectRule"><option value="" disabled>Choose a scoring rule</option><option v-for="rule in rulesQuery.data.value.rules" :key="rule.achievementCode" :value="rule.achievementCode">{{ ruleLabel(rule.achievementCode) }}{{ rule.isEnabled ? '' : ' (disabled)' }}</option></select></label>
+            <label>Scoring rule<select v-model="ruleCode" required @change="selectRule"><option value="" disabled>Choose a scoring rule</option><option v-for="rule in rulesQuery.data.value.rules" :key="rule.achievementCode" :value="rule.achievementCode">{{ ruleLabel(rule.achievementCode) }}{{ rule.isEnabled ? '' : ' (disabled)' }}</option></select><FieldHelp>Select the achievement, bonus, duel or checkpoint to preview and version.</FieldHelp></label>
             <template v-if="achievements.some(item => item.code === ruleCode)">
               <p class="form-intro">Display text is specific to this challenge; changing it does not change the achievement's scoring conditions.</p>
-              <label>Achievement name<InputText v-model="ruleName" required maxlength="120" /></label>
-              <label>Achievement description<InputText v-model="ruleDescription" required maxlength="500" /></label>
-              <label>Achievement category<InputText v-model="ruleCategory" required maxlength="80" /></label>
-              <label v-if="achievements.find(item => item.code === ruleCode)?.canChangeFrequency">Frequency<select v-model="ruleFrequency" required><option value="Once">Once</option><option value="Season">Once per season</option><option value="PerClub">Once per club</option><option value="PerCountry">Once per country</option><option value="ClubSeason">Once per club and season</option></select></label>
-              <label v-if="achievements.find(item => item.code === ruleCode)?.canChangeCupMinimum">Minimum cup matches managed<InputNumber v-model="ruleCupMinimum" required :min="1" :max="1000" /></label>
+              <label>Achievement name<InputText v-model="ruleName" required maxlength="120" /><FieldHelp>Challenge-specific display title; official conditions stay unchanged.</FieldHelp></label>
+              <label>Achievement description<InputText v-model="ruleDescription" required maxlength="500" /><FieldHelp>Display wording only; it does not replace official scoring conditions.</FieldHelp></label>
+              <label>Achievement category<InputText v-model="ruleCategory" required maxlength="80" /><FieldHelp>A display group for this achievement in the challenge.</FieldHelp></label>
+              <label v-if="achievements.find(item => item.code === ruleCode)?.canChangeFrequency">Frequency<select v-model="ruleFrequency" required><option value="Once">Once</option><option value="Season">Once per season</option><option value="PerClub">Once per club</option><option value="PerCountry">Once per country</option><option value="ClubSeason">Once per club and season</option></select><FieldHelp>Limits repeat claims; earlier eligible records count toward the new frequency.</FieldHelp></label>
+              <label v-if="achievements.find(item => item.code === ruleCode)?.canChangeCupMinimum">Minimum cup matches managed<InputNumber v-model="ruleCupMinimum" required :min="1" :max="1000" /><FieldHelp>The cup final must still be managed, regardless of this minimum.</FieldHelp></label>
               <p v-if="achievements.find(item => item.code === ruleCode)?.canChangeFrequency" class="form-intro">Earlier eligible records count toward the new frequency. Automatic milestones retain their fixed frequency.</p>
               <p class="form-intro">Unchanged details retain their value at each existing season boundary.</p>
-              <label class="checkbox-label"><input v-model="applyDisplayedDetails" type="checkbox" /> Apply all displayed details across affected seasons, replacing scheduled values</label>
+              <label class="checkbox-label"><input id="apply-displayed-details" v-model="applyDisplayedDetails" type="checkbox" /> Apply all displayed details across affected seasons, replacing scheduled values</label>
+              <FieldHelp for="apply-displayed-details">Leave unchecked to retain unchanged scheduled details at their existing boundaries.</FieldHelp>
             </template>
-            <div class="form-row"><label>Points<InputNumber v-model="rulePoints" required :min="0" :max="10000" /></label><label>Application<select v-model="rulePolicy"><option value="FromSeason">From a specific season</option><option value="Retroactive">Retroactively to all seasons</option></select></label></div>
-            <label v-if="rulePolicy === 'FromSeason'">First applicable season index<InputNumber v-model="ruleEffectiveSeason" required :min="0" :max="100" /></label>
-            <label class="checkbox-label"><input v-model="ruleEnabled" type="checkbox" /> Rule enabled</label>
-            <label>Reason (optional)<InputText v-model="ruleReason" maxlength="1000" /></label>
+            <div class="form-row"><label>Points<InputNumber v-model="rulePoints" required :min="0" :max="10000" /><FieldHelp>Preview the impact before applying a versioned change.</FieldHelp></label><label>Application<select v-model="rulePolicy"><option value="FromSeason">From a specific season</option><option value="Retroactive">Retroactively to all seasons</option></select><FieldHelp>Retroactive changes apply to all recorded seasons; scheduled changes start at the selected season.</FieldHelp></label></div>
+            <label v-if="rulePolicy === 'FromSeason'">First applicable season<SeasonSelect v-model="ruleEffectiveSeason" :start-year="challengeStartYear" :max-index="seasonChoiceMaxIndex" required /><FieldHelp>Choose the first in-game season affected by this rule change.</FieldHelp></label>
+            <label class="checkbox-label"><input id="rule-enabled" v-model="ruleEnabled" type="checkbox" /> Rule enabled</label>
+            <FieldHelp for="rule-enabled">Enable scoring for this rule in the affected seasons; disabling does not delete records.</FieldHelp>
+            <p class="form-intro">Disabled rules award no points in the affected seasons. Preview before applying; records are not deleted.</p>
+            <label>Reason (optional)<InputText v-model="ruleReason" maxlength="1000" /><FieldHelp>Explain the change for the audited rule history.</FieldHelp></label>
             <p v-if="ruleError" class="form-error" role="alert">{{ ruleError }}</p>
             <Button type="submit" class="outline-button" :loading="saving" label="Preview impact" />
             <div v-if="rulePreview" class="rulebook-note"><div><strong>Preview: version {{ rulePreview.version }} from {{ seasonName(rulePreview.effectiveSeasonIndex) }}</strong><p v-for="impact in rulePreview.impact" :key="impact.participantId">{{ participants.find(item => item.id === impact.participantId)?.trainerName ?? 'Manager' }}: {{ impact.beforeConfirmed }} → {{ impact.afterConfirmed }} confirmed; {{ impact.beforePotential }} → {{ impact.afterPotential }} potential</p><p v-if="rulePreview.beforeWinner !== rulePreview.afterWinner">This change may alter the winning result.</p><Button type="button" class="primary-button" :loading="saving" label="Apply rule version" @click="applyRuleChange" /></div></div>
           </form>
+          </details>
         </template>
       </section>
     </template>
@@ -1989,47 +2205,51 @@ function clubSeasonLabel(stintId: string) {
 
   <Dialog v-model:visible="careerStartDialogVisible" modal header="Career start" :style="{ width: 'min(94vw, 520px)' }">
     <form class="detail-form-grid" @submit.prevent="saveCareerStart">
-      <p class="form-intro">The challenge starts unemployed or at a club below the first division. A first-division job after starting unemployed is allowed. This is self-reported.</p>
-      <label>Starting situation<select v-model="careerStartStatus"><option value="Unemployed">Unemployed</option><option value="Club">Club below the first division</option></select></label>
-      <label v-if="careerStartStatus === 'Club'">Starting club<select v-model="careerStartStintId" required><option value="">Select a recorded club</option><option v-for="club in allClubs.filter(item => item.initialDivisionLevel > 1)" :key="club.id" :value="club.id">{{ careerClubLabel(club) }} · {{ seasonName(club.startSeasonIndex) }} · division {{ club.initialDivisionLevel }}</option></select></label>
-      <p v-if="careerStartStatus === 'Club'">Add the starting club to your career first. If several clubs start in the same season, choose the actual starting club.</p>
+      <p class="form-intro">Choose the situation at the beginning of this save. This is self-reported; a first-division job after starting unemployed is allowed.</p>
+      <label>Starting situation<select v-model="careerStartStatus"><option value="Unemployed">Unemployed</option><option value="Club">Club below the first division</option></select><FieldHelp>Choose the starting point in the save, not your current club.</FieldHelp></label>
+      <label v-if="careerStartStatus === 'Club'">Starting club<select v-model="careerStartStintId" required><option value="">Select a recorded club</option><option v-for="club in allClubs.filter(item => item.initialDivisionLevel > 1)" :key="club.id" :value="club.id">{{ careerClubLabel(club) }} · {{ seasonName(club.startSeasonIndex) }} · division {{ club.initialDivisionLevel }}</option></select><FieldHelp>The selected career stint must begin below the first division.</FieldHelp></label>
+      <div v-if="careerStartStatus === 'Club' && !allClubs.some(item => item.initialDivisionLevel > 1)" class="form-intro">Add the starting club first. It can be entered here without recording a career start in advance.</div>
+      <Button v-if="careerStartStatus === 'Club' && !allClubs.some(item => item.initialDivisionLevel > 1)" type="button" class="outline-button" label="Add starting club" @click="addStartingClub" />
+      <p v-else-if="careerStartStatus === 'Club'">If several clubs start in the same season, select the one that matches your save.</p>
       <p v-if="careerStartError" class="form-error" role="alert">{{ careerStartError }}</p>
-      <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="careerStartDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" label="Save career start" /></div>
+      <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="careerStartDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" :disabled="careerStartStatus === 'Club' && !allClubs.some(item => item.id === careerStartStintId && item.initialDivisionLevel > 1)" label="Save career start" /></div>
     </form>
   </Dialog>
 
   <Dialog v-model:visible="clubDialogVisible" modal :header="editingClub ? 'Edit club stint' : 'Add a club to your career'" :style="{ width: 'min(94vw, 520px)' }">
     <form class="detail-form-grid" @submit.prevent="submitClub">
       <p class="form-intro">Record matches for this stint only. Matches can be combined across stints for the same club; link distinct clubs with the same name and country to distinguish them. Complete detailed season records determine the milestone automatically. Otherwise, record the season in this stint when the club reached 20 matches; if it qualified earlier, use a season in this stint when it was already eligible. Without either, the milestone remains pending.</p>
-      <label>Search club catalog<InputText v-model="clubCatalogSearch" maxlength="120" placeholder="Search by club name" /></label>
+      <label>Search club catalog<InputText v-model="clubCatalogSearch" maxlength="120" placeholder="Search by club name" /><FieldHelp>Search first to reuse a club identity instead of creating a duplicate.</FieldHelp></label>
       <label v-if="clubCatalogQuery.isSuccess.value">Choose a catalog club
         <select :value="selectedCatalogClub?.id ?? ''" @change="selectCatalogClub">
           <option value="">Enter club details manually</option>
           <option v-if="selectedCatalogClub && !clubCatalogQuery.data.value?.some(club => club.id === selectedCatalogClub?.id)" :value="selectedCatalogClub.id">{{ selectedCatalogClub.name }}<template v-if="selectedCatalogClub.identityLabel"> · {{ selectedCatalogClub.identityLabel }}</template> · {{ selectedCatalogClub.countryName }}</option>
           <option v-for="club in clubCatalogQuery.data.value" :key="club.id" :value="club.id">{{ club.name }}<template v-if="club.identityLabel"> · {{ club.identityLabel }}</template> · {{ club.countryName }}</option>
         </select>
+        <FieldHelp>Reuse the correct catalog identity, or choose manual entry below.</FieldHelp>
       </label>
       <p v-else-if="clubCatalogQuery.isPending.value" class="form-intro">Loading the club catalog...</p>
       <p v-else-if="clubCatalogQuery.isError.value" class="form-error" role="alert">Could not load the club catalog. Enter club details manually or try again.</p>
-      <label>Club name<InputText v-model="clubName" required maxlength="120" placeholder="e.g. FC Porto" /></label>
-      <label>Identity label (optional)<InputText v-model="clubIdentityLabel" maxlength="80" placeholder="e.g. Women or Reserves" /></label>
+      <label>Club name<InputText v-model="clubName" required maxlength="120" placeholder="e.g. FC Porto" /><FieldHelp>Select a catalog match where possible; otherwise enter the name used in your save.</FieldHelp></label>
+      <label>Identity label (optional)<InputText v-model="clubIdentityLabel" maxlength="80" placeholder="e.g. Women or Reserves" /><FieldHelp>Use only when separate teams share the same club name and country.</FieldHelp></label>
       <p class="form-intro">Use an identity label to add a distinct club with the same name and country. Existing text-only stints remain unlinked; select their intended identity before adding another same-name stint so their eligibility does not change unexpectedly.</p>
       <label v-if="geographyQuery.isSuccess.value">Choose a country from the catalog
         <select :value="geographyQuery.data.value?.countries.some(item => item.code === countryCode) ? countryCode : ''" @change="selectCatalogCountry">
           <option value="">Select a country</option>
           <option v-for="country in geographyQuery.data.value?.countries" :key="country.code" :value="country.code">{{ country.name }} ({{ country.code }})</option>
         </select>
+        <FieldHelp>Fills the country name and code and determines its continent.</FieldHelp>
       </label>
       <p v-else-if="geographyQuery.isError.value" class="form-error" role="alert">Could not load the country catalog. Enter the country and code manually.</p>
-      <div class="form-row"><label>Country<InputText v-model="countryName" required maxlength="80" placeholder="Portugal" /></label><label>Country code<InputText v-model="countryCode" required maxlength="8" placeholder="PT" /></label></div>
+      <div class="form-row"><label>Country<InputText v-model="countryName" required maxlength="80" placeholder="Portugal" /><FieldHelp>The club's country; selecting a catalog country fills this name and its code.</FieldHelp></label><label>Country code<InputText v-model="countryCode" required maxlength="8" placeholder="PT" /><FieldHelp example="PT">Use the catalog's two-letter code when available.</FieldHelp></label></div>
       <Button type="button" class="outline-button" label="Add entered club to catalog" :loading="saving" @click="createCatalogClub" />
       <p v-if="selectedCatalogClub && catalogClubMatches" class="form-intro">Catalog club selected: {{ selectedCatalogClub.name }}<template v-if="selectedCatalogClub.identityLabel"> · {{ selectedCatalogClub.identityLabel }}</template> · {{ selectedCatalogClub.countryName }}.</p>
       <p v-else-if="selectedCatalogClub" class="form-intro">The edited name or country no longer matches the selected catalog club; saving will unlink it.</p>
       <p v-if="geographyQuery.data.value?.countries.find(item => item.code === countryCode)" class="form-intro">Continent: {{ geographyQuery.data.value.continents.find(item => item.code === geographyQuery.data.value?.countries.find(country => country.code === countryCode)?.continentCode)?.name }}</p>
-      <div class="form-row"><label>Starting season index<InputNumber v-model="clubStartSeason" required :min="0" :max="100" /></label><label>Division level<InputNumber v-model="divisionLevel" required :min="1" :max="20" /></label></div>
-      <label>Ending season index (optional)<InputNumber v-model="clubEndSeason" :min="clubStartSeason" :max="100" /></label>
-      <label>Official matches managed<InputNumber v-model="clubMatches" required :min="0" /></label>
-      <label>Season index when the club reached 20 matches (optional)<InputNumber v-model="clubEligibleSeason" :min="clubStartSeason" :max="clubEndSeason ?? 100" /></label>
+      <div class="form-row"><label>Starting season<SeasonSelect v-model="clubStartSeason" :start-year="challengeStartYear" :max-index="seasonChoiceMaxIndex" required /><FieldHelp>Choose the first season you managed this club.</FieldHelp></label><label>Division level<InputNumber v-model="divisionLevel" required :min="1" :max="20" /><FieldHelp>Use the club's tier in its national league pyramid: 1 is the top division, 2 the next, and so on.</FieldHelp></label></div>
+      <label>Ending season (optional)<SeasonSelect v-model="clubEndSeason" :start-year="challengeStartYear" :min-index="clubStartSeason ?? 0" :max-index="seasonChoiceMaxIndex" include-unset unset-label="Still at this club" /><FieldHelp>Leave unset if this is your current club.</FieldHelp></label>
+      <label>Official matches managed<InputNumber v-model="clubMatches" required :min="0" /><FieldHelp>Include official matches in all competitions for this stint; league-only figures belong in the season form.</FieldHelp></label>
+      <label>Season the club reached 20 matches (optional)<SeasonSelect v-model="clubEligibleSeason" :start-year="challengeStartYear" :min-index="clubStartSeason ?? 0" :max-index="Math.min(seasonChoiceMaxIndex, clubEndSeason ?? seasonChoiceMaxIndex)" include-unset /><FieldHelp>Only attest this when complete per-season match records do not calculate the milestone.</FieldHelp></label>
       <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
       <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="clubDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" label="Save club" /></div>
     </form>
@@ -2037,31 +2257,32 @@ function clubSeasonLabel(stintId: string) {
 
   <Dialog v-model:visible="nationalTeamDialogVisible" modal header="National team stint" :style="{ width: 'min(94vw, 520px)' }">
     <form class="detail-form-grid" @submit.prevent="submitNationalTeam">
-      <label>National team<InputText v-model="nationalTeamForm.teamName" required maxlength="120" /></label>
+      <label>National team<InputText v-model="nationalTeamForm.teamName" required maxlength="120" /><FieldHelp>Club and national-team matches are tracked separately.</FieldHelp></label>
       <label v-if="geographyQuery.isSuccess.value">Team country (optional)
         <select v-model="nationalTeamForm.countryCode"><option value="">Not specified</option><option v-for="country in geographyQuery.data.value?.countries" :key="country.code" :value="country.code">{{ country.name }} ({{ country.code }})</option></select>
+        <FieldHelp>Needed for continent milestones; leave unset only if the country is unknown.</FieldHelp>
       </label>
       <p v-else-if="geographyQuery.isError.value" class="form-error" role="alert">Could not load the country catalog. The existing country will be preserved.</p>
       <p class="form-intro">Set the team country for this stint to count towards the three-continent milestone.</p>
-      <div class="form-row"><label>Starting season index<InputNumber v-model="nationalTeamForm.startSeasonIndex" required :min="0" :max="100" /></label><label>Ending season index (optional)<InputNumber v-model="nationalTeamForm.endSeasonIndex" :min="0" :max="100" /></label></div>
-      <label>Official matches<InputNumber v-model="nationalTeamForm.officialMatches" required :min="0" :max="5000" /></label>
+      <div class="form-row"><label>Starting season<SeasonSelect v-model="nationalTeamForm.startSeasonIndex" :start-year="challengeStartYear" :max-index="seasonChoiceMaxIndex" required /><FieldHelp>Choose the first season you managed this national team.</FieldHelp></label><label>Ending season (optional)<SeasonSelect v-model="nationalTeamForm.endSeasonIndex" :start-year="challengeStartYear" :min-index="nationalTeamForm.startSeasonIndex" :max-index="seasonChoiceMaxIndex" include-unset unset-label="Still managing" /><FieldHelp>Leave unset while you still manage this team.</FieldHelp></label></div>
+      <label>Official matches<InputNumber v-model="nationalTeamForm.officialMatches" required :min="0" :max="5000" /><FieldHelp>Total official matches in this national-team stint across all seasons.</FieldHelp></label>
       <p class="form-intro">Optional season allocations: enter the official matches managed in each season. The allocations must add up to the stint total to calculate the 20-match milestone.</p>
       <div v-for="(row, index) in nationalSeasonMatches" :key="index" class="form-row">
-        <label>Season index<InputNumber v-model="row.seasonIndex" required :min="0" :max="100" /></label>
-        <label>Matches in season<InputNumber v-model="row.officialMatches" required :min="0" :max="5000" /></label>
+        <label>Season<SeasonSelect v-model="row.seasonIndex" :start-year="challengeStartYear" :max-index="seasonChoiceMaxIndex" required /><FieldHelp>Use one allocation for each season with official appearances.</FieldHelp></label>
+        <label>Matches in season<InputNumber v-model="row.officialMatches" required :min="0" :max="5000" /><FieldHelp>Official national-team matches you managed in the selected season.</FieldHelp></label>
         <button type="button" class="link-button" :aria-label="`Remove national team season allocation ${index + 1}`" @click="removeNationalSeasonMatches(index)">Remove</button>
       </div>
       <Button type="button" class="outline-button" label="Add season allocation" @click="addNationalSeasonMatches" />
-      <label>Notes<InputText v-model="nationalTeamForm.notes" maxlength="1000" /></label>
+      <label>Notes<InputText v-model="nationalTeamForm.notes" maxlength="1000" /><FieldHelp>Optional context about this stint; notes do not award points.</FieldHelp></label>
       <p v-if="nationalTeamError" class="form-error" role="alert">{{ nationalTeamError }}</p>
       <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="nationalTeamDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" label="Save national team" /></div>
     </form>
   </Dialog>
 
-  <Dialog v-model:visible="nationalMilestoneDialogVisible" modal header="National team match milestone" :style="{ width: 'min(94vw, 520px)' }">
+  <Dialog :key="nationalMilestoneDialogSession" v-model:visible="nationalMilestoneDialogVisible" modal header="National team match milestone" :style="{ width: 'min(94vw, 520px)' }">
     <form class="detail-form-grid" @submit.prevent="saveNationalMilestone">
       <p class="form-intro">Confirm the FM season in which you reached 20 official matches across your national teams. A stint with recorded matches must be active in that season. Leave it empty to clear the milestone season.</p>
-      <label>20th match season index<InputNumber v-model="nationalMilestoneSeason" :min="0" :max="100" /></label>
+      <label>20th match season<SeasonSelect v-model="nationalMilestoneSeason" :start-year="challengeStartYear" :max-index="seasonChoiceMaxIndex" include-unset /><FieldHelp>Club matches do not count. Leave unset to clear the manual attestation.</FieldHelp></label>
       <p v-if="nationalMilestoneError" class="form-error" role="alert">{{ nationalMilestoneError }}</p>
       <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="nationalMilestoneDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" label="Save milestone" /></div>
     </form>
@@ -2070,11 +2291,11 @@ function clubSeasonLabel(stintId: string) {
   <Dialog v-model:visible="transferDialogVisible" modal header="Transfer details" :style="{ width: 'min(94vw, 560px)' }">
     <form class="detail-form-grid" @submit.prevent="submitTransfer">
       <p class="form-intro">Record the season first. The transfer currency must match that season's currency; currencies are not converted automatically.</p>
-      <label>FM season index<InputNumber v-model="transferForm.seasonIndex" required :min="0" :max="100" /></label>
-      <div class="form-row"><label>Player<InputText v-model="transferForm.playerName" required maxlength="120" /></label><label>Managed club<InputText v-model="transferForm.clubName" required maxlength="120" /></label></div>
-      <div class="form-row"><label>Other club<InputText v-model="transferForm.counterpartyName" required maxlength="120" /></label><label>Type<select v-model="transferForm.direction"><option value="Outgoing">Sale</option><option value="Incoming">Purchase</option></select></label></div>
-      <div class="form-row"><label>Fixed fee<InputNumber v-model="transferForm.fixedAmount" required :min="0" :max-fraction-digits="2" /></label><label>Currency<InputText v-model="transferForm.currency" required maxlength="3" /></label></div>
-      <label>Notes<InputText v-model="transferForm.notes" maxlength="1000" /></label>
+      <label>FM season<SeasonSelect v-model="transferForm.seasonIndex" :start-year="challengeStartYear" :max-index="seasonChoiceMaxIndex" required /><FieldHelp>Select the season in your save, not the real-world transfer window.</FieldHelp></label>
+      <div class="form-row"><label>Player<InputText v-model="transferForm.playerName" required maxlength="120" /><FieldHelp>The player transferred in your save.</FieldHelp></label><label>Managed club<InputText v-model="transferForm.clubName" required maxlength="120" /><FieldHelp>The club whose season record includes this transfer.</FieldHelp></label></div>
+      <div class="form-row"><label>Other club<InputText v-model="transferForm.counterpartyName" required maxlength="120" /><FieldHelp>The club buying from or selling to your managed club.</FieldHelp></label><label>Type<select v-model="transferForm.direction"><option value="Outgoing">Sale</option><option value="Incoming">Purchase</option></select><FieldHelp>A sale is outgoing from your managed club; a purchase is incoming.</FieldHelp></label></div>
+      <div class="form-row"><label>Fixed fee<InputNumber v-model="transferForm.fixedAmount" required :min="0" :max-fraction-digits="2" /><FieldHelp>Enter the guaranteed transfer fee; add-ons are not included.</FieldHelp></label><label>Currency<InputText v-model="transferForm.currency" required maxlength="3" /><FieldHelp example="EUR">Use a three-letter currency code. Values are not converted.</FieldHelp></label></div>
+      <label>Notes<InputText v-model="transferForm.notes" maxlength="1000" /><FieldHelp>Optional context; add-ons should not be included in the fixed fee.</FieldHelp></label>
       <p v-if="transferError" class="form-error" role="alert">{{ transferError }}</p>
       <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="transferDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" label="Save transfer" /></div>
     </form>
@@ -2083,8 +2304,8 @@ function clubSeasonLabel(stintId: string) {
   <Dialog v-model:visible="clubMatchesDialogVisible" modal header="Update club matches" :style="{ width: 'min(94vw, 480px)' }">
     <form class="detail-form-grid" @submit.prevent="submitClubMatches">
       <p class="form-intro">{{ selectedClub?.clubName }}: enter matches in this stint only. Complete detailed season records determine the milestone automatically. Otherwise, record the season in this stint when the club reached 20 matches; if it qualified earlier, use a season in this stint when it was already eligible. Without either, the milestone remains pending.</p>
-      <label>Official matches managed<InputNumber v-model="updatedClubMatches" required :min="0" :max="5000" /></label>
-      <label>Season index when the club reached 20 matches (optional)<InputNumber v-model="updatedEligibleSeason" :min="selectedClub?.startSeasonIndex ?? 0" :max="selectedClub?.endSeasonIndex ?? 100" /></label>
+      <label>Official matches managed<InputNumber v-model="updatedClubMatches" required :min="0" :max="5000" /><FieldHelp>The full updated total for this stint, not only newly played matches.</FieldHelp></label>
+      <label>Season the club reached 20 matches (optional)<SeasonSelect v-model="updatedEligibleSeason" :start-year="challengeStartYear" :min-index="selectedClub?.startSeasonIndex ?? 0" :max-index="Math.min(seasonChoiceMaxIndex, selectedClub?.endSeasonIndex ?? seasonChoiceMaxIndex)" include-unset /><FieldHelp>Only attest the season if complete match allocations do not calculate it.</FieldHelp></label>
       <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
       <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="clubMatchesDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" label="Save matches" /></div>
     </form>
@@ -2093,7 +2314,7 @@ function clubSeasonLabel(stintId: string) {
   <Dialog v-model:visible="continentsMilestoneDialogVisible" modal header="Three continents milestone" :style="{ width: 'min(94vw, 480px)' }">
     <form class="detail-form-grid" @submit.prevent="saveContinentsMilestone">
       <p class="form-intro">Confirm the FM season when you first managed an official club or national team match in a third continent. Record the stints and their matches first. Match totals are per stint, so the exact season is your attestation. Leave empty to clear it.</p>
-      <label>Third continent season index<InputNumber v-model="continentsMilestoneSeason" :min="0" :max="100" /></label>
+      <label>Third continent season<SeasonSelect v-model="continentsMilestoneSeason" :start-year="challengeStartYear" :max-index="seasonChoiceMaxIndex" include-unset /><FieldHelp>Choose the season of your first official match in a third continent.</FieldHelp></label>
       <p v-if="continentsMilestoneError" class="form-error" role="alert">{{ continentsMilestoneError }}</p>
       <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="continentsMilestoneDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" label="Save continent milestone" /></div>
     </form>
@@ -2102,7 +2323,7 @@ function clubSeasonLabel(stintId: string) {
   <Dialog v-model:visible="countryMilestoneDialogVisible" modal header="Country match milestone" :style="{ width: 'min(94vw, 480px)' }">
     <form class="detail-form-grid" @submit.prevent="submitCountryMilestone">
       <p class="form-intro">Record the season when you reached 20 official matches across clubs in {{ selectedClub?.countryName }}, on the stint active for that match. Leave empty to clear this stint's country milestone. Complete detailed season records determine the country milestone automatically; otherwise an eligible club also makes its country eligible.</p>
-      <label>Country 20th-match season index<InputNumber v-model="countryMilestoneSeason" :min="selectedClub?.startSeasonIndex ?? 0" :max="selectedClub?.endSeasonIndex ?? 100" /></label>
+      <label>Country 20th-match season<SeasonSelect v-model="countryMilestoneSeason" :start-year="challengeStartYear" :min-index="selectedClub?.startSeasonIndex ?? 0" :max-index="Math.min(seasonChoiceMaxIndex, selectedClub?.endSeasonIndex ?? seasonChoiceMaxIndex)" include-unset /><FieldHelp>Choose a season within this club stint; leave unset to clear this attestation.</FieldHelp></label>
       <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
       <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="countryMilestoneDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" label="Save country milestone" /></div>
     </form>
@@ -2111,30 +2332,34 @@ function clubSeasonLabel(stintId: string) {
   <Dialog v-model:visible="seasonDialogVisible" modal header="Update season" :style="{ width: 'min(94vw, 620px)' }">
     <form class="detail-form-grid" @submit.prevent="submitSeason">
       <p class="form-intro">Season {{ seasonName(selectedSeasonIndex) }} · Keep the two saves independent; only seasons completed by both unlock duels. Uncheck the completion option to reopen a season.</p>
-      <label class="checkbox-label"><input v-model="useClubBreakdown" type="checkbox" /> Use per-club season statistics</label>
+      <label v-if="selectedSeasonVersion === null">FM season<SeasonSelect v-model="selectedSeasonIndex" :start-year="challengeStartYear" :max-index="100" required /><FieldHelp>Choose a season in this save. To change an existing season, edit its saved record instead.</FieldHelp></label>
+      <label class="checkbox-label"><input id="use-club-breakdown" v-model="useClubBreakdown" type="checkbox" /> Use per-club season statistics</label>
+      <FieldHelp for="use-club-breakdown">Detailed totals replace the quick league summary for scoring; switching views retains the entered rows.</FieldHelp>
       <template v-if="!useClubBreakdown">
         <p v-if="hadSavedClubBreakdown" class="form-intro">Saved club statistics remain available if you switch back to the breakdown.</p>
-        <label v-if="hadSavedClubBreakdown" class="checkbox-label"><input v-model="clearClubBreakdown" type="checkbox" /> Remove the saved club breakdown</label>
-        <div class="form-row"><label>League matches<InputNumber v-model="leagueMatches" required :min="0" /></label><label>League points<InputNumber v-model="leaguePoints" required :min="0" /></label></div>
-        <div class="form-row"><label>Wins<InputNumber v-model="leagueWins" required :min="0" /></label><label>Draws<InputNumber v-model="leagueDraws" required :min="0" /></label><label>Losses<InputNumber v-model="leagueLosses" required :min="0" /></label></div>
-        <div class="form-row"><label>Goals for<InputNumber v-model="goalsFor" required :min="0" /></label><label>Goals against<InputNumber v-model="goalsAgainst" required :min="0" /></label><label>League position<InputNumber v-model="leaguePosition" :min="1" /></label></div>
+        <label v-if="hadSavedClubBreakdown" class="checkbox-label"><input id="clear-club-breakdown" v-model="clearClubBreakdown" type="checkbox" /> Remove the saved club breakdown</label>
+        <FieldHelp v-if="hadSavedClubBreakdown" for="clear-club-breakdown">Only select this to permanently remove saved detail; confirmation is required.</FieldHelp>
+        <div class="form-row"><label>League matches<InputNumber v-model="leagueMatches" required :min="0" /><FieldHelp>Count league matches only; cups and other competitions are excluded.</FieldHelp></label><label>League points<InputNumber v-model="leaguePoints" required :min="0" /><FieldHelp>Points earned in those matches, not challenge points.</FieldHelp></label></div>
+        <div class="form-row"><label>Wins<InputNumber v-model="leagueWins" required :min="0" /><FieldHelp>League wins during your tenure.</FieldHelp></label><label>Draws<InputNumber v-model="leagueDraws" required :min="0" /><FieldHelp>League draws during your tenure.</FieldHelp></label><label>Losses<InputNumber v-model="leagueLosses" required :min="0" /><FieldHelp>League defeats; wins, draws and losses must sum to league matches.</FieldHelp></label></div>
+        <div class="form-row"><label>Goals for<InputNumber v-model="goalsFor" required :min="0" /><FieldHelp>Goals scored in those league matches.</FieldHelp></label><label>Goals against<InputNumber v-model="goalsAgainst" required :min="0" /><FieldHelp>Goals conceded in those league matches.</FieldHelp></label><label>League position<InputNumber v-model="leaguePosition" :min="1" /><FieldHelp>Optional finishing position; 1 means first place.</FieldHelp></label></div>
       </template>
       <template v-else>
         <p class="form-intro">League totals are calculated from these club stints. Record each stint and its total official matches in Career first; allocated season matches cannot exceed that total.</p>
         <p v-if="careerQuery.isError.value" class="form-error" role="alert">Could not load club stints. <button type="button" class="link-button" @click="() => careerQuery.refetch()">Try again</button></p>
         <fieldset v-for="(row, index) in clubSeasonRows" :key="index">
           <legend>Club {{ index + 1 }}</legend>
-          <label>Career stint<select v-model="row.careerStintId" required><option v-for="club in availableSeasonClubs" :key="club.id" :value="club.id">{{ careerClubLabel(club) }} · {{ club.countryCode }} · {{ seasonName(club.startSeasonIndex) }}</option></select></label>
-          <div class="form-row"><label>Division level<InputNumber v-model="row.divisionLevel" required :min="1" :max="100" /></label><label>Official matches<InputNumber v-model="row.officialMatches" required :min="0" :max="5000" /></label><label>League matches<InputNumber v-model="row.leagueMatches" required :min="0" /></label></div>
-          <div class="form-row"><label>Wins<InputNumber v-model="row.leagueWins" required :min="0" /></label><label>Draws<InputNumber v-model="row.leagueDraws" required :min="0" /></label><label>Losses<InputNumber v-model="row.leagueLosses" required :min="0" /></label></div>
-          <div class="form-row"><label>League points<InputNumber v-model="row.leaguePoints" required :min="0" /></label><label>Goals for<InputNumber v-model="row.goalsFor" required :min="0" /></label><label>Goals against<InputNumber v-model="row.goalsAgainst" required :min="0" /></label><label>Final position<InputNumber v-model="row.leaguePosition" :min="1" :max="100" /></label></div>
+          <label>Career stint<select v-model="row.careerStintId" required><option v-for="club in availableSeasonClubs" :key="club.id" :value="club.id">{{ careerClubLabel(club) }} · {{ club.countryCode }} · {{ seasonName(club.startSeasonIndex) }}</option></select><FieldHelp>Select a stint active during this season; each stint can appear once.</FieldHelp></label>
+          <div class="form-row"><label>Division level<InputNumber v-model="row.divisionLevel" required :min="1" :max="100" /><FieldHelp>Level 1 is the top division; larger values are lower tiers.</FieldHelp></label><label>Official matches<InputNumber v-model="row.officialMatches" required :min="0" :max="5000" /><FieldHelp>All competitions for this club and season.</FieldHelp></label><label>League matches<InputNumber v-model="row.leagueMatches" required :min="0" /><FieldHelp>League fixtures only, used for season duels.</FieldHelp></label></div>
+          <div class="form-row"><label>Wins<InputNumber v-model="row.leagueWins" required :min="0" /><FieldHelp>League wins with this club during your tenure.</FieldHelp></label><label>Draws<InputNumber v-model="row.leagueDraws" required :min="0" /><FieldHelp>League draws with this club during your tenure.</FieldHelp></label><label>Losses<InputNumber v-model="row.leagueLosses" required :min="0" /><FieldHelp>League defeats; these results must sum to this row's league matches.</FieldHelp></label></div>
+          <div class="form-row"><label>League points<InputNumber v-model="row.leaguePoints" required :min="0" /><FieldHelp>Points earned in this club's league matches, not challenge points.</FieldHelp></label><label>Goals for<InputNumber v-model="row.goalsFor" required :min="0" /><FieldHelp>Goals scored in this row's league matches.</FieldHelp></label><label>Goals against<InputNumber v-model="row.goalsAgainst" required :min="0" /><FieldHelp>Goals conceded in this row's league matches.</FieldHelp></label><label>Final position<InputNumber v-model="row.leaguePosition" :min="1" :max="100" /><FieldHelp>Optional finishing position of this club; 1 means first place.</FieldHelp></label></div>
           <button type="button" class="link-button" @click="clubSeasonRows.splice(index, 1)">Remove club</button>
         </fieldset>
         <Button type="button" class="outline-button" label="Add club statistics" :disabled="!careerQuery.isSuccess.value || clubSeasonRows.length >= availableSeasonClubs.length" @click="addClubSeason" />
       </template>
-      <div class="form-row"><label>Largest fixed outgoing fee<InputNumber v-model="largestOutgoingTransfer" required :min="0" :max-fraction-digits="2" /></label><label>Currency<InputText v-model="currency" required maxlength="3" /></label></div>
-      <label>Notes<InputText v-model="seasonNotes" maxlength="1000" placeholder="Optional context" /></label>
-      <label class="checkbox-label"><input v-model="isCompleted" type="checkbox" /> Mark this FM season complete</label>
+      <div class="form-row"><label>Largest fixed outgoing fee<InputNumber v-model="largestOutgoingTransfer" required :min="0" :max-fraction-digits="2" /><FieldHelp>The largest single guaranteed sale fee this season, excluding add-ons. Enter 0 if there was no sale.</FieldHelp></label><label>Currency<InputText v-model="currency" required maxlength="3" /><FieldHelp example="EUR">Three-letter code for season and transfer fees; currencies are not converted.</FieldHelp></label></div>
+      <label>Notes<InputText v-model="seasonNotes" maxlength="1000" placeholder="Optional context" /><FieldHelp>Optional context about the season; notes do not affect scoring.</FieldHelp></label>
+      <label class="checkbox-label"><input id="season-complete" v-model="isCompleted" type="checkbox" /> Mark this FM season complete</label>
+      <FieldHelp for="season-complete">Both managers must complete the comparable season to confirm duels. Uncheck to reopen yours.</FieldHelp>
       <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
       <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="seasonDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" label="Save season" /></div>
     </form>
@@ -2143,22 +2368,24 @@ function clubSeasonLabel(stintId: string) {
   <Dialog v-model:visible="achievementDialogVisible" modal :header="selectedAchievement?.name ?? 'Record achievement'" :style="{ width: 'min(94vw, 480px)' }">
     <form class="detail-form-grid" @submit.prevent="submitAchievement">
       <p class="form-intro">The server checks whether this objective is available at its configured frequency. The claim is compared by FM season.</p>
-      <label>FM season index<InputNumber v-model="claimSeason" :min="0" :max="100" required /></label>
+      <p id="claim-attestation-help" class="form-intro">Select an evidence statement only if it is true in your save for the chosen season. Required statements must be confirmed to submit; game results cannot be independently verified.</p>
+      <label>FM season<SeasonSelect v-model="claimSeason" :start-year="challengeStartYear" :max-index="seasonChoiceMaxIndex" required /><FieldHelp>Choose the season in your save when you achieved this result.</FieldHelp></label>
       <label v-if="careerQuery.isSuccess.value && careerQuery.data.value?.clubs.length">Career club (optional)
         <select :value="selectedClaimClub?.id ?? ''" @change="selectClaimCareerClub">
           <option value="">Enter club details manually</option>
           <option v-for="club in careerQuery.data.value.clubs" :key="club.id" :value="club.id">{{ careerClubLabel(club) }} · {{ club.countryCode }} · {{ seasonName(club.startSeasonIndex) }}</option>
         </select>
+        <FieldHelp>Reuse the club's name, country and linked catalog identity for this result.</FieldHelp>
       </label>
       <p v-if="selectedClaimClub?.clubId && claimClubMatches" class="form-intro">This achievement is linked to a catalog club. Changing its name or country unlinks it.</p>
       <p v-else-if="selectedClaimClub?.clubId" class="form-intro">The edited name or country no longer matches the linked catalog club; saving will unlink it.</p>
-      <label>{{ participationKind === 'continental-two-clubs' ? 'Second title club (required)' : participationKind === 'career-move' ? 'New club (required)' : ['first-major-trophy', 'third-to-first'].includes(participationKind ?? '') || ['PerClub', 'ClubSeason'].includes(claimFrequency) ? 'Club (required)' : 'Club, if applicable' }}<InputText v-model="claimClub" :required="['continental-two-clubs', 'career-move', 'first-major-trophy', 'third-to-first'].includes(participationKind ?? '') || ['PerClub', 'ClubSeason'].includes(claimFrequency)" maxlength="120" placeholder="Club name" /></label>
-      <label>{{ ['double', 'continental-two-clubs', 'career-move', 'country-move'].includes(participationKind ?? '') || claimFrequency === 'PerCountry' ? 'Country code (required)' : 'Country code, if applicable' }}<InputText v-model="claimCountry" :required="['double', 'continental-two-clubs', 'career-move', 'country-move'].includes(participationKind ?? '') || claimFrequency === 'PerCountry'" maxlength="8" placeholder="e.g. PT" /></label>
+      <label>{{ participationKind === 'continental-two-clubs' ? 'Second title club (required)' : participationKind === 'career-move' ? 'New club (required)' : ['first-major-trophy', 'third-to-first'].includes(participationKind ?? '') || ['PerClub', 'ClubSeason'].includes(claimFrequency) ? 'Club (required)' : 'Club, if applicable' }}<InputText v-model="claimClub" :required="['continental-two-clubs', 'career-move', 'first-major-trophy', 'third-to-first'].includes(participationKind ?? '') || ['PerClub', 'ClubSeason'].includes(claimFrequency)" maxlength="120" placeholder="Club name" /><FieldHelp>The club associated with this claim; selecting a career club fills these details.</FieldHelp></label>
+      <label>{{ ['double', 'continental-two-clubs', 'career-move', 'country-move'].includes(participationKind ?? '') || claimFrequency === 'PerCountry' ? 'Country code (required)' : 'Country code, if applicable' }}<InputText v-model="claimCountry" :required="['double', 'continental-two-clubs', 'career-move', 'country-move'].includes(participationKind ?? '') || claimFrequency === 'PerCountry'" maxlength="8" placeholder="e.g. PT" /><FieldHelp example="PT">Use the club's catalog country code to distinguish same-name clubs.</FieldHelp></label>
       <p v-if="['PerClub', 'ClubSeason'].includes(claimFrequency)" class="form-intro">Provide the country code to distinguish clubs with the same name in different countries. Without it, the name may match a club in any country.</p>
       <template v-if="supportsCompetition">
         <p v-if="competitionsQuery.isPending.value" class="form-intro">Loading competitions...</p>
         <p v-else-if="competitionsQuery.isError.value" class="form-error" role="alert">Could not load competitions. <button type="button" class="link-button" @click="() => competitionsQuery.refetch()">Try again</button></p>
-        <label v-else>Competition (optional)<select v-model="claimCompetitionId"><option value="">Not specified</option><option v-for="competition in applicableCompetitions" :key="competition.id" :value="competition.id">{{ competition.name }} · {{ competition.tier }}</option></select></label>
+        <label v-else>Competition (optional)<select v-model="claimCompetitionId"><option value="">Not specified</option><option v-for="competition in applicableCompetitions" :key="competition.id" :value="competition.id">{{ competition.name }} · {{ competition.tier }}</option></select><FieldHelp>Link the matching catalog competition to distinguish results played in the same season.</FieldHelp></label>
         <p v-if="competitionsQuery.isSuccess.value" class="form-intro">The challenge administrator can add competitions under Rules. Unspecified competition results use conservative same-season exclusions.</p>
       </template>
       <p v-if="legacyParticipation" class="form-intro">This older record has no achievement condition details. Enter them to save a correction.</p>
@@ -2172,46 +2399,46 @@ function clubSeasonLabel(stintId: string) {
           <option value="ClubWorld">Club world championship</option>
           <option value="NationalWorld">National team World Cup</option>
           <option value="NationalContinental">Continental national team championship</option>
-        </select></label>
+        </select><FieldHelp>Choose the competition actually played, including its continental tier where applicable.</FieldHelp></label>
         <label>Final result<select v-model="participation.competitionResultStage" required>
           <option value="" disabled>Select a result</option>
           <option value="Winner">Winner</option>
           <option value="RunnerUp">Runner-up</option>
           <option value="QuarterFinalElimination">Eliminated in the quarter-final</option>
           <option value="SemiFinalElimination">Eliminated in the semi-final</option>
-        </select></label>
+        </select><FieldHelp>Record the furthest confirmed result in that competition.</FieldHelp></label>
       </template>
       <template v-if="needsLeagueMatches">
-        <div class="form-row"><label>League matches you managed<InputNumber v-model="participation.managedCompetitionMatches" required :min="1" :max="1000" /></label><label>Total league matches<InputNumber v-model="participation.totalCompetitionMatches" required :min="1" :max="1000" /></label></div>
-        <label v-if="participationKind !== 'survival'" class="checkbox-label"><input v-model="participation.inChargeAtCompetitionEnd" type="checkbox" required /> I was in charge at the end of the league competition.</label>
+        <div class="form-row"><label>League matches you managed<InputNumber v-model="participation.managedCompetitionMatches" required :min="1" :max="1000" /><FieldHelp>League appearances while you were responsible for the team.</FieldHelp></label><label>Total league matches<InputNumber v-model="participation.totalCompetitionMatches" required :min="1" :max="1000" /><FieldHelp>Every league match played by the club that season, including those before or after your tenure.</FieldHelp></label></div>
+        <label v-if="participationKind !== 'survival'" class="checkbox-label"><input v-model="participation.inChargeAtCompetitionEnd" type="checkbox" required aria-describedby="claim-attestation-help" /> I was in charge at the end of the league competition.</label>
       </template>
       <template v-if="participationKind === 'cup' || participationKind === 'lower-cup'">
-        <label>Cup matches you managed<InputNumber v-model="participation.managedCompetitionMatches" required :min="claimCupMinimum" :max="1000" /></label>
-        <label class="checkbox-label"><input v-model="participation.managedDecidingMatch" type="checkbox" required /> I managed the cup final.</label>
+        <label>Cup matches you managed<InputNumber v-model="participation.managedCompetitionMatches" required :min="claimCupMinimum" :max="1000" /><FieldHelp>Include the final; this season's rule requires at least {{ claimCupMinimum }} managed cup matches.</FieldHelp></label>
+        <label class="checkbox-label"><input v-model="participation.managedDecidingMatch" type="checkbox" required aria-describedby="claim-attestation-help" /> I managed the cup final.</label>
       </template>
-      <label v-else-if="participationKind === 'supercup'" class="checkbox-label"><input v-model="participation.managedDecidingMatch" type="checkbox" required /> I managed the winning super cup match.</label>
+      <label v-else-if="participationKind === 'supercup'" class="checkbox-label"><input v-model="participation.managedDecidingMatch" type="checkbox" required aria-describedby="claim-attestation-help" /> I managed the winning super cup match.</label>
       <template v-if="participationKind === 'double'">
         <p class="form-intro">Both trophies must be from the country and FM season above.</p>
-        <label class="checkbox-label"><input v-model="participation.wonFirstDivisionTitle" type="checkbox" required /> I won the first-division title.</label>
-        <label class="checkbox-label"><input v-model="participation.wonMajorNationalCup" type="checkbox" required /> I won the major national cup in the same country and season.</label>
-        <label>National cup matches you managed<InputNumber v-model="participation.domesticCupMatchesManaged" required :min="2" :max="1000" /></label>
-        <label class="checkbox-label"><input v-model="participation.managedDecidingMatch" type="checkbox" required /> I managed the cup final.</label>
+        <label class="checkbox-label"><input v-model="participation.wonFirstDivisionTitle" type="checkbox" required aria-describedby="claim-attestation-help" /> I won the first-division title.</label>
+        <label class="checkbox-label"><input v-model="participation.wonMajorNationalCup" type="checkbox" required aria-describedby="claim-attestation-help" /> I won the major national cup in the same country and season.</label>
+        <label>National cup matches you managed<InputNumber v-model="participation.domesticCupMatchesManaged" required :min="2" :max="1000" /><FieldHelp>Count matches in the major national cup, including the final; at least two are required.</FieldHelp></label>
+        <label class="checkbox-label"><input v-model="participation.managedDecidingMatch" type="checkbox" required aria-describedby="claim-attestation-help" /> I managed the cup final.</label>
       </template>
-      <label v-if="participationKind === 'unbeaten'" class="checkbox-label"><input v-model="participation.wonLeagueTitleUnbeaten" type="checkbox" required /> I won the league without a defeat.</label>
-      <label v-if="participationKind === 'lower-cup'" class="checkbox-label"><input v-model="participation.cupWonInLowerDivision" type="checkbox" required /> I won the major national cup with a lower-division club.</label>
+      <label v-if="participationKind === 'unbeaten'" class="checkbox-label"><input v-model="participation.wonLeagueTitleUnbeaten" type="checkbox" required aria-describedby="claim-attestation-help" /> I won the league without a defeat.</label>
+      <label v-if="participationKind === 'lower-cup'" class="checkbox-label"><input v-model="participation.cupWonInLowerDivision" type="checkbox" required aria-describedby="claim-attestation-help" /> I won the major national cup with a lower-division club.</label>
       <template v-if="participationKind === 'promotion'">
-        <label>Division level reached<InputNumber v-model="participation.promotionDestinationLevel" required :min="1" :max="100" /></label>
-        <label class="checkbox-label"><input v-model="participation.promotionWithoutTitle" type="checkbox" required /> The club was promoted without winning the corresponding league title.</label>
+        <label>Division level reached<InputNumber v-model="participation.promotionDestinationLevel" required :min="1" :max="100" /><FieldHelp>The destination after promotion: 1 is the top division, 2 the next tier.</FieldHelp></label>
+        <label class="checkbox-label"><input v-model="participation.promotionWithoutTitle" type="checkbox" required aria-describedby="claim-attestation-help" /> The club was promoted without winning the corresponding league title.</label>
       </template>
       <template v-if="participationKind === 'promotion-streak'">
-        <label>FM season index of the first promotion<InputNumber v-model="participation.promotionStreakStartSeason" required :min="0" :max="100" /></label>
+        <label>First promotion season<SeasonSelect v-model="participation.promotionStreakStartSeason" :start-year="challengeStartYear" :max-index="claimSeason" required /><FieldHelp>This must be the first season in an uninterrupted promotion streak with the same club.</FieldHelp></label>
         <p class="form-intro">The same club must have been promoted in each consecutive season through the milestone season above.</p>
       </template>
       <template v-if="['continental-first', 'continental-repeat', 'continental-top-first'].includes(participationKind ?? '')">
-        <label class="checkbox-label"><input v-model="participation.reachedContinentalMainPhase" type="checkbox" required /> The club reached the competition's main group or league phase.</label>
-        <label v-if="participationKind === 'continental-first'" class="checkbox-label"><input v-model="participation.continentalOrderConfirmed" type="checkbox" required /> This was the club's first continental main-phase participation.</label>
-        <label v-else-if="participationKind === 'continental-repeat'" class="checkbox-label"><input v-model="participation.continentalOrderConfirmed" type="checkbox" required /> The club previously reached a continental main phase.</label>
-        <label v-else class="checkbox-label"><input v-model="participation.firstTopTierMainPhase" type="checkbox" required /> This was the club's first main-phase participation in the top-tier continental competition.</label>
+        <label class="checkbox-label"><input v-model="participation.reachedContinentalMainPhase" type="checkbox" required aria-describedby="claim-attestation-help" /> The club reached the competition's main group or league phase.</label>
+        <label v-if="participationKind === 'continental-first'" class="checkbox-label"><input v-model="participation.continentalOrderConfirmed" type="checkbox" required aria-describedby="claim-attestation-help" /> This was the club's first continental main-phase participation.</label>
+        <label v-else-if="participationKind === 'continental-repeat'" class="checkbox-label"><input v-model="participation.continentalOrderConfirmed" type="checkbox" required aria-describedby="claim-attestation-help" /> The club previously reached a continental main phase.</label>
+        <label v-else class="checkbox-label"><input v-model="participation.firstTopTierMainPhase" type="checkbox" required aria-describedby="claim-attestation-help" /> This was the club's first main-phase participation in the top-tier continental competition.</label>
       </template>
       <template v-if="participationKind === 'continental-two-clubs'">
         <p class="form-intro">The season above is when you won the title with the second club.</p>
@@ -2220,13 +2447,14 @@ function clubSeasonLabel(stintId: string) {
             <option value="">Enter first title club details manually</option>
             <option v-for="club in careerQuery.data.value.clubs" :key="club.id" :value="club.id">{{ careerClubLabel(club) }} · {{ club.countryCode }} · {{ seasonName(club.startSeasonIndex) }}</option>
           </select>
+          <FieldHelp>Use the earlier winning club's career identity, or enter its details below.</FieldHelp>
         </label>
         <p v-if="selectedFirstTitleClub?.clubId && firstTitleClubMatches" class="form-intro">The first title club is linked to the club catalog. Changing its name or country unlinks it.</p>
         <p v-else-if="selectedFirstTitleClub?.clubId" class="form-intro">The edited first title club no longer matches the linked catalog club; saving will unlink it.</p>
-        <label>First title club<InputText v-model="participation.firstContinentalTitleClub" required maxlength="120" /></label>
-        <label>First title club country code<InputText v-model="participation.firstContinentalTitleCountry" required maxlength="8" /></label>
-        <label>First title season index<InputNumber v-model="participation.firstContinentalTitleSeason" required :min="0" :max="100" /></label>
-        <label class="checkbox-label"><input v-model="participation.wonContinentalTitlesWithBothClubs" type="checkbox" required /> I won a continental club trophy with each club.</label>
+        <label>First title club<InputText v-model="participation.firstContinentalTitleClub" required maxlength="120" /><FieldHelp>The different club with which you won your earlier continental title.</FieldHelp></label>
+        <label>First title club country code<InputText v-model="participation.firstContinentalTitleCountry" required maxlength="8" /><FieldHelp>Use that club's catalog country code to identify the earlier winner.</FieldHelp></label>
+        <label>First title season<SeasonSelect v-model="participation.firstContinentalTitleSeason" :start-year="challengeStartYear" :max-index="claimSeason" required /><FieldHelp>Choose the season of the earlier continental title; it cannot be after this claim.</FieldHelp></label>
+        <label class="checkbox-label"><input v-model="participation.wonContinentalTitlesWithBothClubs" type="checkbox" required aria-describedby="claim-attestation-help" /> I won a continental club trophy with each club.</label>
       </template>
       <template v-if="participationKind === 'career-move' || participationKind === 'country-move'">
         <p class="form-intro">{{ participationKind === 'career-move' ? 'First record both clubs in your career. The new club must have at least 20 matches across its stints;' : 'First record your starting club and stints in the new country. The country must have at least 20 matches across those stints;' }} use the season in which that milestone was reached. If multiple clubs begin in your earliest season, identify your actual starting club below.</p>
@@ -2235,34 +2463,35 @@ function clubSeasonLabel(stintId: string) {
             <option value="">Enter starting club details manually</option>
             <option v-for="club in careerQuery.data.value.clubs" :key="club.id" :value="club.id">{{ careerClubLabel(club) }} · {{ club.countryCode }} · {{ seasonName(club.startSeasonIndex) }}</option>
           </select>
+          <FieldHelp>Select the actual original club in your save, not only the latest club you left.</FieldHelp>
         </label>
         <p v-if="selectedStartingClub?.clubId && startingClubMatches" class="form-intro">The starting club is linked to the club catalog. Changing its name or country unlinks it.</p>
         <p v-else-if="selectedStartingClub?.clubId" class="form-intro">The edited starting club no longer matches the linked catalog club; saving will unlink it.</p>
-        <label>Starting club<InputText v-model="participation.startingCareerClub" required maxlength="120" /></label>
-        <label>Starting club country code<InputText v-model="participation.startingCareerCountry" required maxlength="8" /></label>
+        <label>Starting club<InputText v-model="participation.startingCareerClub" required maxlength="120" /><FieldHelp>The actual starting club in your career, not just the most recent club you left.</FieldHelp></label>
+        <label>Starting club country code<InputText v-model="participation.startingCareerCountry" required maxlength="8" /><FieldHelp>The original club's country; use its catalog code to avoid same-name ambiguity.</FieldHelp></label>
       </template>
-      <label v-if="participationKind === 'first-division-experience'" class="checkbox-label"><input v-model="participation.firstDivisionExperience" type="checkbox" required /> This was my first experience managing in the first division.</label>
+      <label v-if="participationKind === 'first-division-experience'" class="checkbox-label"><input v-model="participation.firstDivisionExperience" type="checkbox" required aria-describedby="claim-attestation-help" /> This was my first experience managing in the first division.</label>
       <template v-if="participationKind === 'first-major-trophy'">
         <p class="form-intro">An earlier attested major trophy for this identified club contradicts this claim. Records without a reliable club identity and ordering within a season cannot be verified.</p>
-        <label class="checkbox-label"><input v-model="participation.firstMajorClubTrophy" type="checkbox" required /> This was my first major trophy with this club.</label>
-        <label class="checkbox-label"><input v-model="participation.trophyNotSuperCup" type="checkbox" required /> The trophy was not a super cup.</label>
+        <label class="checkbox-label"><input v-model="participation.firstMajorClubTrophy" type="checkbox" required aria-describedby="claim-attestation-help" /> This was my first major trophy with this club.</label>
+        <label class="checkbox-label"><input v-model="participation.trophyNotSuperCup" type="checkbox" required aria-describedby="claim-attestation-help" /> The trophy was not a super cup.</label>
       </template>
-      <label v-if="participationKind === 'ten-major-trophies'" class="checkbox-label"><input v-model="participation.wonTenMajorTrophies" type="checkbox" required /> I had won at least ten major trophies by this season.</label>
+      <label v-if="participationKind === 'ten-major-trophies'" class="checkbox-label"><input v-model="participation.wonTenMajorTrophies" type="checkbox" required aria-describedby="claim-attestation-help" /> I had won at least ten major trophies by this season.</label>
       <template v-if="participationKind === 'third-to-first'">
-        <label>Season index managing this club in the third division<InputNumber v-model="participation.thirdDivisionStartSeason" required :min="0" :max="claimSeason" /></label>
-        <label class="checkbox-label"><input v-model="participation.stayedWithClubFromThirdToFirst" type="checkbox" required /> I stayed with the same club from the third division until reaching the first.</label>
+        <label>Season managed in the third division<SeasonSelect v-model="participation.thirdDivisionStartSeason" :start-year="challengeStartYear" :max-index="claimSeason" required /><FieldHelp>Choose the in-game season when you began this continuous progression with the club.</FieldHelp></label>
+        <label class="checkbox-label"><input v-model="participation.stayedWithClubFromThirdToFirst" type="checkbox" required aria-describedby="claim-attestation-help" /> I stayed with the same club from the third division until reaching the first.</label>
       </template>
-      <label v-if="participationKind === 'manager-of-year'" class="checkbox-label"><input v-model="participation.officialManagerOfYear" type="checkbox" required /> I won the official Football Manager Manager of the Year award.</label>
+      <label v-if="participationKind === 'manager-of-year'" class="checkbox-label"><input v-model="participation.officialManagerOfYear" type="checkbox" required aria-describedby="claim-attestation-help" /> I won the official Football Manager Manager of the Year award.</label>
       <template v-if="participationKind === 'higher-division-move'">
         <p class="form-intro">Lower division numbers represent higher levels. Enter your previous best and the division of the new club.</p>
-        <label>Best division previously managed<InputNumber v-model="participation.previousBestDivisionLevel" required :min="2" :max="100" /></label>
-        <label>New club division<InputNumber v-model="participation.newDivisionLevel" required :min="1" :max="99" /></label>
-        <label class="checkbox-label"><input v-model="participation.higherDivisionClubMove" type="checkbox" required /> This was my first move to a club in a division higher than any I had previously managed.</label>
+        <label>Best division previously managed<InputNumber v-model="participation.previousBestDivisionLevel" required :min="2" :max="100" /><FieldHelp>The highest tier in your earlier career; smaller numbers mean higher divisions.</FieldHelp></label>
+        <label>New club division<InputNumber v-model="participation.newDivisionLevel" required :min="1" :max="99" /><FieldHelp>The new tier must be higher than your previous best, so its number must be smaller.</FieldHelp></label>
+        <label class="checkbox-label"><input v-model="participation.higherDivisionClubMove" type="checkbox" required aria-describedby="claim-attestation-help" /> This was my first move to a club in a division higher than any I had previously managed.</label>
       </template>
-      <label v-if="needsPromotion" class="checkbox-label"><input v-model="participation.firstSeasonAfterPromotion" type="checkbox" required /> This was the club's first season after promotion to the first division.</label>
-      <label v-if="participationKind === 'survival'" class="checkbox-label"><input v-model="participation.avoidedRelegation" type="checkbox" required /> The club remained in the first division.</label>
-      <label v-if="needsPosition">Final league position<InputNumber v-model="participation.competitionLeaguePosition" required :min="1" :max="1000" /></label>
-      <label>Notes<InputText v-model="claimNotes" maxlength="1000" placeholder="Optional context" /></label>
+      <label v-if="needsPromotion" class="checkbox-label"><input v-model="participation.firstSeasonAfterPromotion" type="checkbox" required aria-describedby="claim-attestation-help" /> This was the club's first season after promotion to the first division.</label>
+      <label v-if="participationKind === 'survival'" class="checkbox-label"><input v-model="participation.avoidedRelegation" type="checkbox" required aria-describedby="claim-attestation-help" /> The club remained in the first division.</label>
+      <label v-if="needsPosition">Final league position<InputNumber v-model="participation.competitionLeaguePosition" required :min="1" :max="1000" /><FieldHelp>The club's final league position in the claimed season; 1 means first place.</FieldHelp></label>
+      <label>Notes<InputText v-model="claimNotes" maxlength="1000" placeholder="Optional context" /><FieldHelp>Optional self-reported context for this claim.</FieldHelp></label>
       <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
       <div class="dialog-actions"><Button type="button" class="cancel-button" label="Cancel" @click="achievementDialogVisible = false" /><Button type="submit" class="primary-button" :loading="saving" :label="selectedClaim ? 'Save changes' : 'Record achievement'" /></div>
     </form>

@@ -18,6 +18,26 @@ Vite serves the app at `http://localhost:5173` and proxies `/api` and `/hubs` to
 
 Sign-in uses Google OAuth through the backend. Configure the Google client ID and secret on the API as described in the backend README; the frontend does not contain provider credentials.
 
+## Guided workspace
+
+The public product example explains the challenge target, not a pretend personal score or progress widget.
+
+The signed-out dashboard is a public landing page with Google sign-in and a short product guide; personal challenge counts, invitations and create actions appear only after the profile succeeds. Initial session loading is neutral, including when retrying without a cached profile. Only HTTP 401 means signed out: denied access (403), network and server failures show explanations and retry, not a misleading landing page. A failed refetch also removes cached personal workspace chrome and closes its dialogs. Account actions explicitly offer **Edit profile** and **Sign out**.
+
+An invitation query remains on the URL through dashboard navigation. Before Google sign-in, its token is also kept in this tab's session storage for up to one hour and restored to Invitations when the callback returns without the query. This requires browser storage; the token is removed from storage after restoration and never automatically accepted. Joining or accepting an invitation offers a confirmed **Open joined challenge** destination. Invitation, notification, creation and sign-out actions lock while pending and report failures without inventing success.
+
+After sign-in, Overview, My challenges, Invitations and How it works are URL-backed dashboard views (`/dashboard?view=challenges`, `invitations` or `help`). Existing `#active-challenges`, `#invitations` and `#about` links are redirected to their matching views. Browser back and forward navigate between workspace views. Mobile navigation uses a two-column grid so every destination is visible, rather than hiding full-width buttons in a horizontal scroller.
+
+Challenge navigation prioritizes Overview, Career, Seasons and Achievements. Transfers, Activity and Rules are in the secondary More menu, which identifies the selected task; transfers are also linked from Seasons. Sections are shareable as `?section=career|seasons|achievements|transfers|activity|rules`; Overview omits the query. Reload and browser history retain supported sections, invalid values fall back to Overview, and Draft gameplay sections also fall back to Overview. Moving between challenge IDs creates separate view/query/realtime lifecycles; changing sections within one challenge does not remount it.
+
+Read availability is distinct from permission to write. Published records remain readable while a rival or required career start is missing, and after completion or archive. Gameplay writes, including country-match evidence, need an Active challenge, a loaded career and any required starting declaration. Club creation and career setup remain available while awaiting a rival, avoiding a circular starting-club prerequisite. Add the club from the setup prompt first if needed; saving it returns to setup with the new eligible club selected. Existing careers where a start is not required remain unblocked. Changing section or losing write eligibility closes stale gameplay dialogs without discarding readable navigation. Archive/restore remain confirmed administrator actions under **Manage challenge**.
+
+Season choices display a calendar season and a one-based ordinal (for example, `2026/27 — Season 1`). All forms can choose the full supported API range, indices 0–100, within their contextual start/end constraints; unset values remain available where optional. New season entry includes an explicit season choice; editing an existing season keeps its identity/version, and new entry cannot silently overwrite another saved season. The frontend still sends zero-based indices to the API. Field guidance includes concise instructions and expandable examples. `FieldHelp` associates descriptions with enclosing controls or an explicit `for` target for sibling-labelled fields; evidence checkboxes reference their shared self-attestation guidance.
+
+International career, timeline totals/actions and manual milestone evidence are expandable. Collapsing them does not remove records; saved records and invalid warnings stay discoverable, while irrelevant calculated milestone panels wait until setup is complete and relevant records exist. Switching between quick season entry and per-club details retains the entered breakdown; saved breakdowns remain stored when a quick summary is saved unless their removal is explicitly requested.
+
+Rules uses focused **Invitations**, **Version and change history**, **Continental competitions**, **Custom achievement** and **Scoring rules** expanders. Draft values survive collapsing a task; catalog CRUD, rule previews, scheduled versions and confirmations remain unchanged. Unknown routes offer a useful home link. Challenge failures distinguish sign-in required, denied access, missing records and retryable failures, with a dashboard recovery action.
+
 When creating a challenge, select the official achievements that should initially be enabled. Choose **Save as draft** to configure rules and competitions before publishing and inviting a rival. Gameplay is unavailable until publication. An administrator can enable other official achievements or create challenge-specific custom achievements in the challenge's Rules tab.
 
 Administrators can customize achievement names, descriptions and categories through the versioned rule editor. These are display labels only: they do not change the official scoring conditions. The achievement list shows the latest configured text, including scheduled changes, while score breakdown labels follow the rule version for each event. Enter the catalog wording explicitly to restore it.
@@ -30,7 +50,7 @@ The Rules tab also lets administrators preview and version the points and enable
 
 New users complete profile onboarding before using the dashboard. The profile can be edited later, including an optional HTTPS avatar URL. A challenge overview includes a detailed score-event breakdown with pending and exclusion explanations.
 
-For new careers, record the starting situation in the Career tab before entering results: either unemployed or a starting club below the first division. Add the starting club first when selecting a club start. Managing a first-division club after an unemployed start is allowed. Existing careers can add this self-reported information without losing historical data.
+For new careers that require it, record the starting situation in the Career tab before entering results: either unemployed or a starting club below the first division. The setup prompt can open the club form before the starting club has been recorded, avoiding a circular prerequisite. Managing a first-division club after an unemployed start is allowed. Existing careers can add this self-reported information without losing historical data.
 
 New league-title, national and league cup, super cup, promoted-club, continental-participation and two-club continental title claims request the player's relevant self-attested participation and result details. Older claims are preserved; missing details must be supplied when correcting them.
 
@@ -64,6 +84,38 @@ npm run build
 ```
 
 For browser journeys, install Chromium with `npx playwright install chromium` and start the backend's **test-only E2E host** on `127.0.0.1:5196` as described in the backend README. Playwright starts a loopback-only Vite server and runs desktop and mobile Chromium tests in both themes against that host. These tests use a dedicated database and test identities, not OAuth; they add data and do not clear it.
+
+Functional journeys cover the public landing/help, URL navigation and history, provider-return invitation recovery, initial-club setup, saved-data preservation, two-manager scoring/reconnection, notifications, authorization and correction lifecycle. The provider-return case substitutes only the external Google redirect; it does not validate real Google credentials or OAuth configuration.
+
+### Action and state evidence
+
+`scripts\verify-ux-inventory.mjs` inventories every template action, form submit, disclosure and editable/output control in the two views and shared controls. It records source locations, handler/route bindings, role/status gates, pending bindings, field context/bounds and handler bodies with API calls, confirmations and failure-state assignments. It fails on actionless buttons or editable controls lacking field context. This static wiring evidence is not a claim that every action was clicked in every state.
+
+```powershell
+node scripts\verify-ux-inventory.mjs
+# Optional: pass an absolute path to save the JSON inventory outside the repository.
+```
+
+| Surface / actions | Regression evidence |
+| --- | --- |
+| Landing, public help, Google CTA, pending invitation, dashboard sections and legacy links | `guided-workspace.spec.ts`: anonymous state without counters/create, help/back/forward, preserved invite, simulated provider return; `DashboardView.test.ts`: initial loading, 401/403/503, cached-profile failure and empty/unavailable counters |
+| Challenge section links, More, A-to-B identity, invalid URLs, archive/restore, Draft publication, completion/reopen | `final-action-flows.spec.ts`, `lifecycle-notifications.spec.ts`, `correction-lifecycle.spec.ts`: in-app identity/history/reload, read-only sections, participant restrictions, management confirmations; route and eligibility unit regressions |
+| Join, accept/decline, generated invitation, managed creation/revoke, notifications | `two-manager.spec.ts`, `lifecycle-notifications.spec.ts`, `final-action-flows.spec.ts`: successful destinations and persisted state; dashboard unit cases: pending join/accept/decline/sign-out, failures without success, notification read persistence and clipboard-denied fallback |
+| Career start, club creation/edit/removal, catalog/manual identities, match evidence, national teams and allocations | Guided setup and two-manager journeys, plus final state case: required start, pending rival, country-evidence unlock/save, stored zero-based index 100, correct challenge identity; career eligibility and required/legacy-state unit cases |
+| Season create/edit, quick/detailed totals, saved breakdown preservation, reopen and transfer add/edit/delete/currency handling | Two-manager/correction journeys and final season-100 save; final action journey persists transfer CRUD, rejects mismatched currency, confirms season-driven currency relabel without converting fees, and cancels then confirms removal; existing unit cases preserve breakdowns and correction |
+| Achievement claims/corrections/removal, evidence options and scoring-event breakdown | Two-manager and correction journeys; existing evidence/catalog/unit regressions preserve participation, frequency and versioned scoring semantics |
+| Rules disclosures, competition create/edit/delete, custom achievement, version preview/apply/history | Final focused-Rules journey: collapse/reopen preserves entered values, CRUD persists, scheduling at index 100, publication and managed invites; two-manager journey exercises rule impact/scoring |
+| Profile cancel/validation/save/reload, explicit sign-out, challenge 401/403/404 and unknown-route recovery | Final profile/recovery journeys; real logout endpoint called, then test-only identity cookie removed to simulate the production auth-cookie transition |
+| National-team deletion and season allocation removal | Bounded `remaining national actions` journey: cancel both confirmations, remove an allocation then cancel the edit without changing saved rows, confirm/save removal and reload the remaining allocation, confirm stint removal and verify empty API/UI after reload |
+| National-team, club, country and three-continent manual milestone clearing | Bounded `remaining` journeys first persist an attestation, cancel clearing and verify it survives, then explicitly save unset values and reload/reopen the forms to verify null remains stored; supporting club/team match totals remain unchanged |
+| Per-club season row removal and explicit saved-breakdown removal | Bounded `remaining club allocation` journey: row removal is local until season save, Cancel preserves both saved rows, Save/reload retains the remaining row, cancel the permanent-breakdown confirmation preserves it, then confirm/save/reload leaves no breakdown without deleting career stints |
+| Labels, field descriptions/examples, seasons and themes | Static control inventory, `FieldHelp.test.ts`, selector boundary unit cases, contextual labels used throughout browser forms; four desktop/mobile × dark/light projects and captured state screenshots |
+
+The bounded follow-up covers national-team removal, national-team and per-club allocation-row removal, saved-breakdown removal, and clearing every manual milestone type through real isolated API writes and reloads across all four projects. Clearing a manual attestation is not an instruction to erase an automatically calculated milestone: complete allocations can still establish eligibility under the existing backend rules.
+
+The national milestone dialog gets a fresh session when reopened, so a preceding close animation cannot remove the new dialog during cancel/reopen/save. Its values and concurrency version are still populated from the current career record.
+
+Remaining unexercised branches: every scoring-rule subtype is not exhaustively browser-exercised. Live Google consent/callback and production-cookie expiry/logout, storage-disabled behavior, browser-specific clipboard success permissions, all network/CSRF/concurrency failure permutations, and every confirmation-cancel branch remain unverified. Static handler evidence and existing validation guards cover wiring, not those outcomes. Accessibility auditing remains deferred to V4; context-association regressions do not constitute a WCAG audit.
 
 Accessibility checks remain available for V4. While accessibility testing is deferred, run functional browser journeys without axe audits or keyboard/reduced-motion checks:
 
