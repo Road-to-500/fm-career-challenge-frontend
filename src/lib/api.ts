@@ -42,10 +42,13 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     const body = (await response.json().catch(() => undefined)) as
-      | { title?: string; detail?: string }
+      | { title?: string; detail?: string; errors?: Record<string, string[]> }
       | undefined
+    const validationMessages = body?.errors
+      ? Object.values(body.errors).flat().filter((message): message is string => typeof message === 'string').join(' ')
+      : ''
     throw new ApiError(
-      body?.detail ?? body?.title ?? `Request failed (${response.status}).`,
+      validationMessages || body?.detail || body?.title || `Request failed (${response.status}).`,
       response.status,
     )
   }
@@ -54,8 +57,8 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T
 }
 
-export function signIn(provider: 'google' | 'microsoft'): void {
-  window.location.assign(`${apiBase}/api/auth/${provider}`)
+export function signIn(): void {
+  window.location.assign(`${apiBase}/api/auth/google`)
 }
 
 export function signOut(): Promise<void> {

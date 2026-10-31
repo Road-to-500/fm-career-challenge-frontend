@@ -1,0 +1,33 @@
+app = "road-to-500-web-prod"
+primary_region = "fra"
+kill_signal = "SIGQUIT"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+
+[build.args]
+  NGINX_CONFIG_FILE = "nginx.fly.conf"
+  VITE_API_BASE_URL = ""
+
+[http_service]
+  internal_port = 80
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[http_service.checks]]
+  method = "GET"
+  path = "/health"
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+
+[http_service.checks.headers]
+  Host = "road-to-500-web-prod.fly.dev"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "256mb"

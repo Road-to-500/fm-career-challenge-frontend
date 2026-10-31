@@ -1,7 +1,7 @@
 import tailwindcss from '@tailwindcss/vite'
 import vue from '@vitejs/plugin-vue'
 import { loadEnv } from 'vite'
-import { defineConfig } from 'vitest/config'
+import { configDefaults, defineConfig } from 'vitest/config'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', '')
@@ -22,6 +22,7 @@ export default defineConfig(({ mode }) => {
       },
     },
     test: {
+      exclude: [...configDefaults.exclude, 'e2e/**'],
       environment: 'jsdom',
       restoreMocks: true,
     },

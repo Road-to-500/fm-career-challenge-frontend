@@ -5,6 +5,7 @@ export type SessionProfile = {
   displayName: string
   email: string
   avatarUrl?: string
+  hasCompletedOnboarding: boolean
 }
 
 export const useSessionStore = defineStore('session', {
